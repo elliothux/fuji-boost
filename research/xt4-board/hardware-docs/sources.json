@@ -1,0 +1,127 @@
+{
+  "research_date": "2026-10-28",
+  "timezone": "Asia/Shanghai",
+  "sources": [
+    {
+      "id": "S01",
+      "url": "https://photo-parts.com.ua/parts/dbphp.php?part=Fujifilm+X-T4",
+      "type": "repair-site component observation",
+      "inspected": "X-T4 row, system MCU and power-device columns, PCB image-folder href",
+      "supports": "R5F100EDA is listed as system MCU; actual board image locations exist",
+      "does_not_support": "physical SPI endpoint, MCU application registers or GPIO12.5 routing",
+      "cache": "photo-parts-xt4.html"
+    },
+    {
+      "id": "S02",
+      "url": "https://photo-parts.com.ua/parts/part_profile.php?part=9219",
+      "type": "repair-site component profile",
+      "inspected": "MCU classification and image placeholder",
+      "supports": "database component classification only",
+      "does_not_support": "a readable package photograph, application protocol or board connections"
+    },
+    {
+      "id": "S03",
+      "url": "https://photo-parts.com.ua/parts/imgbrowse.php?folder=IMG_STORE/Fujifilm%20X-T4%20PCB",
+      "type": "original board photograph index",
+      "inspected": "six actual image links",
+      "supports": "image locations only; pixels/markings/net traces were not independently identified in this pass",
+      "image_urls": [
+        "https://photo-parts.com.ua/parts/IMG_STORE/Fujifilm%20X-T4%20PCB/Fujifilm%20XT4_PCB.jpg",
+        "https://photo-parts.com.ua/parts/IMG_STORE/Fujifilm%20X-T4%20PCB/Fujifilm%20XT4_PCB_1.jpg"
+      ]
+    },
+    {
+      "id": "S04",
+      "url": "https://www.renesas.com/en/products/rl78-g13/part-details/r5f100edana-w0",
+      "type": "manufacturer part page",
+      "inspected": "exact ordering-part page and linked family documents",
+      "supports": "RL78/G13 family for the full R5F100EDANA part",
+      "does_not_support": "full ordering suffix or MCU identity of the user's physical camera"
+    },
+    {
+      "id": "S05",
+      "url": "https://www.renesas.com/document/dst/rl78g13-data-sheet?language=en",
+      "type": "manufacturer datasheet",
+      "document": "R01DS0131EJ0380 Rev3.80, 2024-10-31",
+      "inspected": "printed pages1-3,37; memory/ordering tables and CSI naming note",
+      "supports": "48KiB code,4KiB data flash,3KiB RAM,40-pin family and serial capability",
+      "does_not_support": "camera application SPI protocol"
+    },
+    {
+      "id": "S06",
+      "url": "https://www.renesas.com/en/document/man/rl78g13-users-manual-hardware?language=en",
+      "type": "manufacturer hardware manual",
+      "document": "R01UH0146EJ0380 Rev3.80, 2024-10-31",
+      "inspected": "printed pages2,3,37,108,121",
+      "supports": "xD memory map, vectors, little-endian vector addresses, conditional boot swap, available CSI pins",
+      "does_not_support": "DAT contents or X-T4 board wiring/application register side effects",
+      "cache": "rl78g13-hardware.pdf",
+      "sha256": "f25502674005c6e9f06241ab8348c15698336eea1361d8d5b87dd6b65bb1a2f9"
+    },
+    {
+      "id": "S07",
+      "url": "https://www.renesas.com/en/document/apn/rl78g13-78k0kx2-migration-guide-78k0-rl78-interrupt-functions-rev100",
+      "type": "manufacturer application note",
+      "document": "R01AN4941EJ0100 Rev1.00, 2019-09-12",
+      "inspected": "Table4.6, printed page10",
+      "supports": "G13 reset vector address00000H",
+      "does_not_support": "a specific byte sequence identifying Fujifilm firmware"
+    },
+    {
+      "id": "S08",
+      "url": "https://www.analog.com/media/en/technical-documentation/data-sheets/max77812.pdf",
+      "type": "manufacturer datasheet",
+      "inspected": "printed pages40-44 SPI framing and register map",
+      "supports": "32-bit transaction with 10-bit address,8-bit data,packet-length and single/multiple fields; active-low SCS",
+      "conclusion": "does not match loader seven-bit register/sixteen-bit data/checksum protocol",
+      "acquisition": "web PDF read succeeded; shell PDF acquisition timed out"
+    },
+    {
+      "id": "S09",
+      "url": "https://www.analog.com/media/en/technical-documentation/data-sheets/MAX77960-MAX77961.pdf",
+      "type": "manufacturer datasheet",
+      "document": "19-100909 Rev1,2024-06",
+      "inspected": "printed pages1-2,interface/control description",
+      "supports": "I2C/resistor charger-control interface",
+      "conclusion": "not evidence for a direct matching SPI peer"
+    },
+    {
+      "id": "S10",
+      "url": "https://raw.githubusercontent.com/torvalds/linux/master/arch/arm/boot/dts/socionext/milbeaut-m10v.dtsi",
+      "type": "primary kernel source",
+      "inspected": "compatible and clock-control address",
+      "supports": "M10V is sc2000a; clock controller at1d021000",
+      "does_not_support": "FF4230 identity,fff4a400/fff48700 aliases or fields"
+    },
+    {
+      "id": "S11",
+      "url": "https://raw.githubusercontent.com/torvalds/linux/master/drivers/clk/clk-milbeaut.c",
+      "type": "primary Socionext-authored kernel source",
+      "inspected": "M10V register definitions and SPI parent mux table",
+      "supports": "related platform has an SPI clock mux",
+      "does_not_support": "importing those clocks/register semantics into XP4"
+    },
+    {
+      "id": "S12",
+      "url": "https://26oclock.com/posts/fuji-g-firmware-decompilation/",
+      "type": "author's measured lens-protocol research",
+      "inspected": "target and four-byte protocol scope",
+      "supports": "the article studies GF lens/body communication",
+      "does_not_support": "power-peer identity or register17 semantics; excluded as a protocol authority for this task"
+    },
+    {
+      "id": "L01",
+      "path": "../../xt4-startup-frontier/ASSESSMENT.md",
+      "type": "existing source-bound loader analysis",
+      "supports": "Boolean writes atfff4a400 and their callers",
+      "does_not_support": "physical register side effects"
+    },
+    {
+      "id": "L02",
+      "path": "../spi-frontier/ASSESSMENT.md",
+      "type": "existing source-bound loader analysis",
+      "supports": "four-byte checksum frames,CS descriptor,ready-bit branch,register17 write,channel selector",
+      "does_not_support": "real hardware replies or endpoint register semantics"
+    }
+  ]
+}

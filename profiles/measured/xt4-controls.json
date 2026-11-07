@@ -1,0 +1,457 @@
+{
+  "source": "research/real-camera/session-20261101/controls.json — controls.gpio and dialPositionsAdc; active-low momentary buttons. ADC values are only the measured channel for each dial, never the other snapshot channels. Catalog checkpoint ADC levels do not match measured positions; the UI shows — until operated. No writes on load.",
+  "buttons": {
+    "shutter_button": [
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        1
+      ]
+    ],
+    "q_button": [
+      [
+        7,
+        14
+      ]
+    ],
+    "af_on_button": [
+      [
+        7,
+        13
+      ]
+    ],
+    "ae_lock_button": [
+      [
+        9,
+        4
+      ]
+    ],
+    "playback_button": [
+      [
+        8,
+        6
+      ]
+    ],
+    "fn1_button": [
+      [
+        0,
+        14
+      ]
+    ],
+    "view_mode_button": [
+      [
+        9,
+        3
+      ]
+    ],
+    "focus_stick.press": [
+      [
+        7,
+        7
+      ]
+    ],
+    "focus_stick.up": [
+      [
+        7,
+        6
+      ]
+    ],
+    "focus_stick.down": [
+      [
+        7,
+        5
+      ]
+    ],
+    "focus_stick.left": [
+      [
+        7,
+        4
+      ]
+    ],
+    "focus_stick.right": [
+      [
+        7,
+        3
+      ]
+    ]
+  },
+  "dials": {
+    "shutter_speed_dial": {
+      "channel": 6,
+      "positions": [
+        {
+          "id": "A",
+          "value": 4095
+        },
+        {
+          "id": "8000",
+          "value": 3821
+        },
+        {
+          "id": "4000",
+          "value": 3555
+        },
+        {
+          "id": "2000",
+          "value": 3294
+        },
+        {
+          "id": "1000",
+          "value": 3044
+        },
+        {
+          "id": "500",
+          "value": 2793
+        },
+        {
+          "id": "250",
+          "value": 2550
+        },
+        {
+          "id": "125",
+          "value": 2314
+        },
+        {
+          "id": "60",
+          "value": 2080
+        },
+        {
+          "id": "30",
+          "value": 1847
+        },
+        {
+          "id": "15",
+          "value": 1616
+        },
+        {
+          "id": "8",
+          "value": 1391
+        },
+        {
+          "id": "4",
+          "value": 1164
+        },
+        {
+          "id": "2",
+          "value": 934
+        },
+        {
+          "id": "1",
+          "value": 702
+        },
+        {
+          "id": "T",
+          "value": 473
+        },
+        {
+          "id": "B",
+          "value": 236
+        }
+      ]
+    },
+    "sensitivity_dial": {
+      "channel": 5,
+      "positions": [
+        {
+          "id": "A",
+          "value": 4095
+        },
+        {
+          "id": "160",
+          "value": 183
+        },
+        {
+          "id": "200",
+          "value": 370
+        },
+        {
+          "id": "250",
+          "value": 559
+        },
+        {
+          "id": "320",
+          "value": 740
+        },
+        {
+          "id": "400",
+          "value": 929
+        },
+        {
+          "id": "500",
+          "value": 1113
+        },
+        {
+          "id": "640",
+          "value": 1297
+        },
+        {
+          "id": "800",
+          "value": 1480
+        },
+        {
+          "id": "1000",
+          "value": 1668
+        },
+        {
+          "id": "1250",
+          "value": 1851
+        },
+        {
+          "id": "1600",
+          "value": 2039
+        },
+        {
+          "id": "2000",
+          "value": 2221
+        },
+        {
+          "id": "2500",
+          "value": 2408
+        },
+        {
+          "id": "3200",
+          "value": 2594
+        },
+        {
+          "id": "4000",
+          "value": 2777
+        },
+        {
+          "id": "5000",
+          "value": 2966
+        },
+        {
+          "id": "6400",
+          "value": 3155
+        },
+        {
+          "id": "8000",
+          "value": 3341
+        },
+        {
+          "id": "10000",
+          "value": 3530
+        },
+        {
+          "id": "12800",
+          "value": 3718
+        },
+        {
+          "id": "C",
+          "value": 3906
+        }
+      ]
+    },
+    "exposure_compensation_dial": {
+      "channel": 7,
+      "positions": [
+        {
+          "id": "C",
+          "value": 200
+        },
+        {
+          "id": "+3",
+          "value": 399
+        },
+        {
+          "id": "+2.7",
+          "value": 597
+        },
+        {
+          "id": "+2.3",
+          "value": 792
+        },
+        {
+          "id": "+2",
+          "value": 985
+        },
+        {
+          "id": "+1.7",
+          "value": 1178
+        },
+        {
+          "id": "+1.3",
+          "value": 1370
+        },
+        {
+          "id": "+1",
+          "value": 1562
+        },
+        {
+          "id": "+0.7",
+          "value": 1755
+        },
+        {
+          "id": "+0.3",
+          "value": 1949
+        },
+        {
+          "id": "0",
+          "value": 2146
+        },
+        {
+          "id": "-0.3",
+          "value": 2344
+        },
+        {
+          "id": "-0.7",
+          "value": 2547
+        },
+        {
+          "id": "-1",
+          "value": 2746
+        },
+        {
+          "id": "-1.3",
+          "value": 2961
+        },
+        {
+          "id": "-1.7",
+          "value": 3178
+        },
+        {
+          "id": "-2",
+          "value": 3397
+        },
+        {
+          "id": "-2.3",
+          "value": 3622
+        },
+        {
+          "id": "-2.7",
+          "value": 3858
+        },
+        {
+          "id": "-3",
+          "value": 4095
+        }
+      ]
+    },
+    "drive_dial": {
+      "channel": 3,
+      "positions": [
+        {
+          "id": "hdr",
+          "value": 4095
+        },
+        {
+          "id": "S",
+          "value": 3476
+        },
+        {
+          "id": "CL",
+          "value": 2882
+        },
+        {
+          "id": "CH",
+          "value": 2292
+        },
+        {
+          "id": "BKT",
+          "value": 1720
+        },
+        {
+          "id": "ADV.",
+          "value": 1151
+        },
+        {
+          "id": "panorama",
+          "value": 581
+        }
+      ]
+    }
+  },
+  "switches": {
+    "still_movie_mode_dial": {
+      "STILL": [
+        [
+          9,
+          6,
+          true
+        ]
+      ],
+      "MOVIE": [
+        [
+          9,
+          6,
+          false
+        ]
+      ]
+    },
+    "focus_mode_selector": {
+      "S": [
+        [
+          4,
+          7,
+          true
+        ],
+        [
+          4,
+          8,
+          false
+        ]
+      ],
+      "C": [
+        [
+          4,
+          7,
+          true
+        ],
+        [
+          4,
+          8,
+          true
+        ]
+      ],
+      "M": [
+        [
+          4,
+          7,
+          false
+        ],
+        [
+          4,
+          8,
+          true
+        ]
+      ]
+    }
+  },
+  "encoders": {
+    "front_command_dial": {
+      "channels": [
+        1,
+        2
+      ],
+      "clockwise": [
+        [
+          3582,
+          3565
+        ],
+        [
+          3583,
+          112
+        ],
+        [
+          116,
+          155
+        ],
+        [
+          160,
+          3584
+        ]
+      ],
+      "source": "research/real-camera/session-20261101/jig/steps.jsonl lines 101–105: paired samples (HH: line101 sample0; others: final samples); CW HH→HL→LL→LH, CCW reversed. HH wrap is the Gray-cycle closure; see .cache/dials/EVIDENCE.md.",
+      "holdInstructions": 24000000
+    },
+    "rear_command_dial": {
+      "channels": [8, 9],
+      "clockwise": [[3598, 3585], [3598, 316], [316, 316], [316, 3585]],
+      "source": "research/real-camera/session-20261101/controls.json adc.rear_dial_encoder and jig/steps.jsonl lines 106–110 supply ADC8/9 and H≈3582–3598, ADC8 L≈314–317. ADC9 low and the missing states are reconstructed at these levels, not captured physical pairs. Unpatched firmware at 0x1206984 uses A=ADC8, B=ADC9, phase map 0x172D2DC and transition table 0x172D29C, byte-identical to front table 0x172D214 (A=ADC1, B=ADC2). Assumption: physical CW is the firmware direction with the same sign as measured front CW: HH→HL→LL→LH, tag1/+1; reverse is tag2/-1. Live counters confirm every edge in REC/MENU; T-mode shutter and menu cursor respond both ways. See .cache/rear-dial/EVIDENCE.md and decoder-evidence.json; physical rear CW remains unmeasured.",
+      "holdInstructions": 24000000
+    }
+  }
+}

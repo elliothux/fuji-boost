@@ -1,0 +1,28 @@
+{
+  "upstream_commit": "1de936e9b1ca738b04ad5132c727288ddd5eb2ae",
+  "sources": [
+    {
+      "path": "catalog/soc/xp4/soc.json",
+      "sha256": "434bb9bf5ce3f8d5118b0a3e7400f6ee80e67fafe22a5945da4af47b5a28ee94"
+    },
+    {
+      "path": "catalog/bodies/xt4/body.json",
+      "sha256": "9996f3c9ed9cb6c77c4b953fcd4862442f59ddf433c332c6596857f75b9a8db4"
+    },
+    {
+      "path": "configurations/emulator/xt4-discovery/hardware-inputs.json",
+      "sha256": "ec1ae4829d69526efecf39eaea58e5e657f53794d28b14deca79d26b79b4085f"
+    }
+  ],
+  "measured": {
+    "path": "profiles/measured/xt4.json",
+    "dram_bytes": 2147483648
+  },
+  "limits": [
+    "DRAM size is measured (profiles/measured/xt4.json); other catalog hardware inputs are declarations, not measurements of this camera.",
+    "Power SPI framing overrides the catalog peer: the X-T4 loader uses the four-byte checksum protocol; RTC and writes remain unmodeled.",
+    "Flash is attached only in the explicit erased-NOR diagnostic profile; JEDEC/geometry/timing are catalog declarations, not measured identity or installed contents.",
+    "SD media and USB are not attached; update-to-physical-flash placement is unverified.",
+    "Frame inputs are synthetic; no physical sensor equivalence is claimed."
+  ]
+}

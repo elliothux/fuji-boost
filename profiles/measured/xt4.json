@@ -1,0 +1,42 @@
+{
+  "schema": 1,
+  "dram_bytes": 2147483648,
+  "dram_evidence": "2026-11-01 jig-mode RAM reads on X-T4 2.12 (research/real-camera/session-20261101): 0x00000000-0x7fffffff readable apart from the unmapped first page; 0x3E1B0000 and 0x1E1B0000 differ, and every 16 MiB sample above 512 MiB differs from low memory. Consistent with the 16 Gbit LPDDR4 PoP on the GFX50S II X-Processor 4 teardown.",
+  "jig_baseline": {
+    "note": "Pin levels read through ff80 app80 (input register, includes pins the jig firmware drives as outputs) with both cards inserted, no lens, LCD in normal position, dials as left by the user. Not yet wired into the board profile.",
+    "source": "research/real-camera/session-20261101/jig/steps.jsonl baseline; identical in jig-recheck",
+    "gpio": [
+      32103,
+      16388,
+      8186,
+      655,
+      384,
+      0,
+      31,
+      32760,
+      1137,
+      248,
+      7680,
+      8,
+      10,
+      1440,
+      60,
+      252
+    ],
+    "adc": [
+      2471,
+      3588,
+      3579,
+      3477,
+      4080,
+      4095,
+      4095,
+      2145,
+      3602,
+      3595,
+      2477,
+      2279
+    ],
+    "controls": "research/real-camera/session-20261101/controls.json"
+  }
+}

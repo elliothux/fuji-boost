@@ -1,0 +1,58 @@
+diff --git a/crates/emulator-xp4-board/src/definition.rs b/crates/emulator-xp4-board/src/definition.rs
+--- a/crates/emulator-xp4-board/src/definition.rs
++++ b/crates/emulator-xp4-board/src/definition.rs
+@@ -12,6 +12,8 @@
+     pub ram_size: usize,
+     pub cores: usize,
+     pub discovery: bool,
++    #[serde(default)]
++    pub discovery_passive: bool,
+     #[serde(default)]
+     pub memory_regions: Vec<super::memory::Region>,
+     #[serde(default)]
+diff --git a/crates/emulator-xp4-board/src/lib.rs b/crates/emulator-xp4-board/src/lib.rs
+--- a/crates/emulator-xp4-board/src/lib.rs
++++ b/crates/emulator-xp4-board/src/lib.rs
+@@ -61,6 +61,7 @@
+     recent: Vec<VecDeque<(u32, u32)>>,
+     milestones: BTreeMap<(usize, u32), u64>,
+     discovery: Discovery,
++    discovery_passive: bool,
+     failure: Option<String>,
+     redirected: Option<u32>,
+     pages: BTreeMap<u64, Vec<Box<MmioHook>>>,
+@@ -292,7 +293,8 @@
+     fn due(&self) {
+         if let Err(error) = self.devices_due() {
+             unsafe {
+-                (*self.state.get()).failure = Some(error);
++                // A failed device can leave a deadline; retain the causal error.
++                (*self.state.get()).failure.get_or_insert(error);
+                 for cpu in &self.cpus {
+                     let _ = cpu.stop();
+                 }
+@@ -875,7 +877,7 @@
+             .record(hook.core, address, pc, size, write, response);
+         if write {
+             state.discovery.observe_write(address, size);
+-        } else if !owned {
++        } else if !owned && !state.discovery_passive {
+             response = state.discovery.observe_read(
+                 hook.core,
+                 pc,
+@@ -915,6 +917,7 @@
+             ram_size,
+             cores,
+             discovery,
++            discovery_passive,
+             memory_regions,
+             initial_registers,
+             labels,
+@@ -1229,6 +1232,7 @@
+                 recent: (0..cores).map(|_| VecDeque::new()).collect(),
+                 milestones: BTreeMap::new(),
+                 discovery: ledger,
++                discovery_passive,
+                 failure: None,
+                 redirected: None,
+                 pages: BTreeMap::new(),

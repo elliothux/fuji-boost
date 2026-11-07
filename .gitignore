@@ -1,0 +1,13 @@
+/references/
+
+*.DAT
+node_modules/
+dist/
+target/
+pkg/
+.cache/
+.DS_Store
+*.log
+*.tsbuildinfo
+/public/runtime/
+.temp/

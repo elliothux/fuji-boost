@@ -1,0 +1,40 @@
+# Bare-metal X-T4 firmware image for the XP4 emulator. Build through
+# `bun run firmware:build`, which bundles the TSX app first and then runs
+# cargo with the pinned nightly (rust-toolchain.toml) and build-std.
+[package]
+name = "fuji-boost-firmware"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "fuji-boost"
+path = "src/main.rs"
+test = false
+bench = false
+
+[features]
+default = ["pocket"]
+# PocketJS: ui-cabi + QuickJS + pocket_runtime.c + mini libc. Without it the
+# image is the M1 HAL demo that paints a test pattern.
+pocket = ["dep:pocketjs-ui-cabi"]
+
+[dependencies]
+pocketjs-ui-cabi = { path = "../references/pocketjs/engine/ui-cabi", default-features = false, features = ["software-only"], optional = true }
+
+[build-dependencies]
+cc = "1.2"
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+
+[profile.dev]
+opt-level = 1
+panic = "abort"
+
+[workspace]

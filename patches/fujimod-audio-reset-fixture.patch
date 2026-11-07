@@ -1,0 +1,724 @@
+diff --git a/crates/emulator-xp4-board/src/definition.rs b/crates/emulator-xp4-board/src/definition.rs
+--- a/crates/emulator-xp4-board/src/definition.rs
++++ b/crates/emulator-xp4-board/src/definition.rs
+@@ -52,6 +52,10 @@
+     pub xpp_serial: Vec<u64>,
+     #[serde(default)]
+     pub cache_sizes: Option<(u32, u32, u32)>,
++    #[serde(default)]
++    pub audio_reset_fixture_ticks: Option<u64>,
++    #[serde(default)]
++    pub audio_reset_second_command: bool,
+     #[serde(default)]
+     pub io_group_base: Option<u64>,
+     #[serde(default)]
+diff --git a/crates/emulator-xp4-board/src/devices.rs b/crates/emulator-xp4-board/src/devices.rs
+--- a/crates/emulator-xp4-board/src/devices.rs
++++ b/crates/emulator-xp4-board/src/devices.rs
+@@ -603,6 +603,29 @@
+             ))));
+         self.windows.push((base, base + 0xa0, id));
+     }
++    pub fn audio_reset_fixture(&mut self, ticks: u64) -> Result<(), String> {
++        let (base, end) = (0xfff4f01c, 0xfff4f020);
++        if self.windows.iter().any(|&(lo, hi, _)| base < hi && lo < end) {
++            return Err("Overlapping audio reset fixture wiring".into());
++        }
++        let model = fujimod_emulator_xp4_io::audio_reset_fixture::AudioResetFixture::new(ticks)?;
++        let id = self.models.len();
++        self.models.push(Some(Box::new(model)));
++        self.windows.push((base, end, id));
++        Ok(())
++    }
++    pub fn audio_reset_second_command_fixture(&mut self, ticks: u64) -> Result<(), String> {
++        use fujimod_emulator_xp4_io::audio_reset_fixture::AudioResetFixture;
++        let (base, end) = (0xfff4f01c, 0xfff4f020);
++        if self.windows.iter().any(|&(lo, hi, _)| base < hi && lo < end) {
++            return Err("Overlapping second FFF4F01C command fixture wiring".into());
++        }
++        let model = AudioResetFixture::new_with_second_command(ticks)?;
++        let id = self.models.len();
++        self.models.push(Some(Box::new(model)));
++        self.windows.push((base, end, id));
++        Ok(())
++    }
+     pub fn decompressor(&mut self, base: u64, irq: u32) {
+         let id = self.models.len();
+         let high = std::sync::Arc::new(std::sync::Mutex::new([0; 2]));
+diff --git a/crates/emulator-xp4-board/src/lib.rs b/crates/emulator-xp4-board/src/lib.rs
+--- a/crates/emulator-xp4-board/src/lib.rs
++++ b/crates/emulator-xp4-board/src/lib.rs
+@@ -939,6 +939,8 @@
+             xpp_storage,
+             xpp_serial,
+             cache_sizes,
++            audio_reset_fixture_ticks,
++            audio_reset_second_command,
+             io_group_base,
+             decompressor,
+             lcdc,
+@@ -1070,6 +1072,17 @@
+             devices
+                 .get_or_insert_with(devices::Devices::empty)
+                 .xpp_serial(base)?;
++        }
++        if audio_reset_second_command && audio_reset_fixture_ticks.is_none() {
++            return Err("Second FFF4F01C command requires the initial audio reset fixture".into());
++        }
++        if let Some(ticks) = audio_reset_fixture_ticks {
++            let devices = devices.get_or_insert_with(devices::Devices::empty);
++            if audio_reset_second_command {
++                devices.audio_reset_second_command_fixture(ticks)?;
++            } else {
++                devices.audio_reset_fixture(ticks)?;
++            }
+         }
+         if let Some((inputs, sample_ticks)) = adc {
+             devices
+diff --git a/crates/emulator-xp4-io/src/lib.rs b/crates/emulator-xp4-io/src/lib.rs
+--- a/crates/emulator-xp4-io/src/lib.rs
++++ b/crates/emulator-xp4-io/src/lib.rs
+@@ -11,2 +11,3 @@
+ pub mod temperature;
+ pub mod usb_phy;
++pub mod audio_reset_fixture;
+diff --git a/crates/emulator-xp4-io/src/audio_reset_fixture.rs b/crates/emulator-xp4-io/src/audio_reset_fixture.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/emulator-xp4-io/src/audio_reset_fixture.rs
+@@ -0,0 +1,635 @@
++//! Single synthetic reset request, with an explicit two-command experiment.
++//! Delay and word-zero completion are virtual conventions, not physical reset/clock laws.
++use fujimod_emulator_devices::{Cx, Device, Record, Value as Field, checkpoint::Checkpoint};
++use serde::{Deserialize, Serialize};
++
++const NAME: &str = "xp4-audio-reset-fixture";
++const ADDRESS: u64 = 0xfff4f01c;
++const TOKEN: u64 = 1;
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Request {
++    command: u32,
++    started: u64,
++    due: u64,
++    token: u64,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
++enum Stage {
++    Idle,
++    Pending(Request),
++    Done(Request),
++}
++
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct State {
++    ticks: u64,
++    stage: Stage,
++    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
++    allow_second_command: bool,
++}
++
++pub struct AudioResetFixture {
++    state: State,
++}
++
++impl AudioResetFixture {
++    pub fn new(ticks: u64) -> Result<Self, String> {
++        if !(1..=1_000_000).contains(&ticks) {
++            return Err("Invalid audio reset fixture latency".into());
++        }
++        Ok(Self {
++            state: State {
++                ticks,
++                stage: Stage::Idle,
++                allow_second_command: false,
++            },
++        })
++    }
++
++    /// Opt-in synthetic second command; no physical audio identity or timing is implied.
++    pub fn new_with_second_command(ticks: u64) -> Result<Self, String> {
++        let mut fixture = Self::new(ticks)?;
++        fixture.state.allow_second_command = true;
++        Ok(fixture)
++    }
++
++    fn access(address: u64, size: u8) -> bool {
++        address == ADDRESS && size == 4
++    }
++
++    fn validate_state(&self, state: &State) -> Result<(), String> {
++        if state.ticks != self.state.ticks {
++            return Err("Audio reset checkpoint latency differs".into());
++        }
++        if state.allow_second_command != self.state.allow_second_command {
++            return Err("Audio reset checkpoint command policy differs".into());
++        }
++        if let Stage::Pending(r) | Stage::Done(r) = state.stage {
++            if r.command != 1
++                || !(r.token == TOKEN || (state.allow_second_command && r.token == 2))
++                || r.started.checked_add(state.ticks) != Some(r.due)
++            {
++                return Err("Invalid audio reset checkpoint request/deadline".into());
++            }
++        }
++        Ok(())
++    }
++}
++
++impl Device for AudioResetFixture {
++    fn name(&self) -> &'static str {
++        NAME
++    }
++
++    fn read(&mut self, cx: &mut Cx<'_>, address: u64, size: u8) -> u64 {
++        if Self::access(address, size) {
++            match self.state.stage {
++                Stage::Pending(_) => return 1,
++                Stage::Done(_) => return 0,
++                Stage::Idle => {}
++            }
++        }
++        cx.fail("Unknown audio reset fixture read");
++        0
++    }
++
++    fn write(&mut self, cx: &mut Cx<'_>, address: u64, size: u8, value: u64) {
++        if !Self::access(address, size) || value != 1 {
++            cx.fail("Unsupported audio reset fixture write");
++            return;
++        }
++        let token = match self.state.stage {
++            Stage::Pending(_) => return, // Same request never postpones the scheduled completion.
++            Stage::Done(request) if self.state.allow_second_command && request.token == TOKEN => 2,
++            Stage::Done(_) => {
++                cx.fail("Audio reset fixture reentry is not modeled");
++                return;
++            }
++            Stage::Idle => TOKEN,
++        };
++        let Some(due) = cx.now().checked_add(self.state.ticks) else {
++            cx.fail("Audio reset fixture deadline overflow");
++            return;
++        };
++        let request = Request {
++            command: 1,
++            started: cx.now(),
++            due,
++            token,
++        };
++        self.state.stage = Stage::Pending(request);
++        cx.schedule(due, token);
++        cx.record(Record::new(
++            "XP4 audio reset fixture scheduled",
++            [
++                ("address", Field::int(ADDRESS)),
++                ("command", Field::int(request.command)),
++                ("tick", Field::int(request.started)),
++                ("due", Field::int(due)),
++            ]
++            .into_iter()
++            .chain(
++                self.state
++                    .allow_second_command
++                    .then_some(("ordinal", Field::int(request.token))),
++            ),
++        ));
++    }
++
++    fn event(&mut self, cx: &mut Cx<'_>, token: u64) {
++        let Stage::Pending(request) = self.state.stage else {
++            return;
++        };
++        if token != request.token || cx.now() < request.due {
++            return;
++        }
++        self.state.stage = Stage::Done(request);
++        cx.record(Record::new(
++            "XP4 audio reset fixture completed",
++            [
++                ("address", Field::int(ADDRESS)),
++                ("command", Field::int(request.command)),
++                ("tick", Field::int(request.due)),
++            ]
++            .into_iter()
++            .chain(
++                self.state
++                    .allow_second_command
++                    .then_some(("ordinal", Field::int(request.token))),
++            ),
++        ));
++    }
++
++    fn advance(&mut self, cx: &mut Cx<'_>) {
++        if let Stage::Pending(request) = self.state.stage {
++            self.event(cx, request.token);
++        }
++    }
++
++    fn next_deadline(&self, _: u64) -> Option<u64> {
++        if let Stage::Pending(request) = self.state.stage {
++            Some(request.due)
++        } else {
++            None
++        }
++    }
++
++    fn pollable(&self, address: u64, size: u8) -> bool {
++        Self::access(address, size) && !matches!(self.state.stage, Stage::Idle)
++    }
++
++    fn save(&self) -> serde_json::Value {
++        serde_json::to_value(&self.state).unwrap()
++    }
++
++    fn checkpoint(&self) -> Result<Checkpoint, String> {
++        Checkpoint::encode(NAME, &self.state)
++    }
++
++    fn validate_checkpoint(&self, saved: &Checkpoint) -> Result<(), String> {
++        if !saved.blobs().is_empty() || !saved.children().is_empty() {
++            return Err("Unexpected audio reset checkpoint attachments".into());
++        }
++        self.validate_state(&saved.decode(NAME)?)
++    }
++
++    fn restore_checkpoint(&mut self, saved: &Checkpoint) -> Result<(), String> {
++        self.validate_checkpoint(saved)?;
++        self.state = saved.decode(NAME)?;
++        Ok(())
++    }
++
++    fn fingerprint(&self) -> Result<serde_json::Value, String> {
++        Ok(self.save())
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use fujimod_emulator_devices::Host;
++
++    #[derive(Default)]
++    struct Clock {
++        now: u64,
++        events: Vec<(u64, u64)>,
++        records: Vec<Record>,
++    }
++    impl Host for Clock {
++        fn now(&self) -> u64 {
++            self.now
++        }
++        fn schedule(&mut self, _: usize, at: u64, token: u64) {
++            self.events.push((at, token));
++        }
++        fn set_irq(&mut self, _: u32, _: bool) {
++            panic!("fixture must not route IRQs");
++        }
++        fn raise_irq(&mut self, _: usize, _: u32) -> Result<(), String> {
++            panic!("fixture must not raise IRQs");
++        }
++        fn ram_read(&self, _: u64, _: &mut [u8]) -> Result<(), String> {
++            panic!("fixture must not read guest RAM");
++        }
++        fn ram_write(&mut self, _: u64, _: &[u8]) -> Result<(), String> {
++            panic!("fixture must not write guest RAM");
++        }
++        fn record(&mut self, record: Record) {
++            self.records.push(record);
++        }
++    }
++
++    fn refused(
++        m: &mut AudioResetFixture,
++        h: &mut Clock,
++        address: u64,
++        size: u8,
++        value: Option<u64>,
++    ) {
++        let before = m.save();
++        let events = h.events.clone();
++        let records = h.records.clone();
++        let mut cx = Cx::new(h, 0, 0, 0);
++        if let Some(v) = value {
++            m.write(&mut cx, address, size, v);
++        } else {
++            m.read(&mut cx, address, size);
++        }
++        assert!(cx.refusal().is_some());
++        assert_eq!(m.save(), before);
++        assert_eq!(h.events, events);
++        assert_eq!(h.records, records);
++    }
++
++    fn transfer(core: usize, pc: u64) -> (serde_json::Value, Vec<Record>) {
++        let mut m = AudioResetFixture::new(8).unwrap();
++        let mut h = Clock {
++            now: 100,
++            ..Default::default()
++        };
++        assert!(!m.pollable(ADDRESS, 4));
++        refused(&mut m, &mut h, ADDRESS, 4, None);
++        m.write(&mut Cx::new(&mut h, core, pc, 0), ADDRESS, 4, 1);
++        assert_eq!(m.next_deadline(100), Some(108));
++        assert!(m.pollable(ADDRESS, 4));
++        let pending = m.save();
++        h.now = 103;
++        m.write(&mut Cx::new(&mut h, 3 - core, pc + 4, 0), ADDRESS, 4, 1);
++        assert_eq!(m.save(), pending);
++        assert_eq!(h.events, [(108, TOKEN)]);
++        for _ in 0..20 {
++            assert_eq!(m.read(&mut Cx::new(&mut h, core, pc, 0), ADDRESS, 4), 1);
++        }
++        h.now = 107;
++        m.event(&mut Cx::new(&mut h, core, pc, 0), TOKEN);
++        m.advance(&mut Cx::new(&mut h, core, pc, 0));
++        assert_eq!(m.save(), pending);
++        h.now = 108;
++        m.event(&mut Cx::new(&mut h, core, pc, 0), TOKEN + 1);
++        assert_eq!(m.save(), pending);
++        m.advance(&mut Cx::new(&mut h, core, pc, 0));
++        assert_eq!(m.read(&mut Cx::new(&mut h, core, pc, 0), ADDRESS, 4), 0);
++        assert_eq!(m.next_deadline(108), None);
++        m.event(&mut Cx::new(&mut h, core, pc, 0), TOKEN);
++        assert_eq!(
++            h.records,
++            vec![
++                Record::new(
++                    "XP4 audio reset fixture scheduled",
++                    [
++                        ("address", Field::int(ADDRESS)),
++                        ("command", Field::int(1u32)),
++                        ("tick", Field::int(100u64)),
++                        ("due", Field::int(108u64))
++                    ]
++                ),
++                Record::new(
++                    "XP4 audio reset fixture completed",
++                    [
++                        ("address", Field::int(ADDRESS)),
++                        ("command", Field::int(1u32)),
++                        ("tick", Field::int(108u64))
++                    ]
++                ),
++            ]
++        );
++        refused(&mut m, &mut h, ADDRESS, 4, Some(1));
++        (m.save(), h.records)
++    }
++
++    #[test]
++    fn audio_reset_fixture_is_clocked_once_and_independent_of_core_pc_or_poll_count() {
++        assert_eq!(transfer(0, 0x1000), transfer(3, 0xdead0000));
++    }
++
++    #[test]
++    fn audio_reset_fixture_rejects_unknown_inputs_without_mutation() {
++        for ticks in [0, 1_000_001, u64::MAX] {
++            assert!(AudioResetFixture::new(ticks).is_err());
++        }
++        assert!(AudioResetFixture::new(1).is_ok());
++        assert!(AudioResetFixture::new(1_000_000).is_ok());
++        let mut m = AudioResetFixture::new(8).unwrap();
++        let mut h = Clock::default();
++        for phase in 0..3 {
++            for (a, s) in [
++                (ADDRESS - 4, 4),
++                (ADDRESS + 1, 4),
++                (ADDRESS + 4, 4),
++                (ADDRESS, 1),
++                (ADDRESS, 2),
++                (ADDRESS, 8),
++            ] {
++                refused(&mut m, &mut h, a, s, Some(1));
++                refused(&mut m, &mut h, a, s, None);
++            }
++            for value in [0, 2, 0x100, 0x100000001, u64::MAX] {
++                refused(&mut m, &mut h, ADDRESS, 4, Some(value));
++            }
++            if phase == 0 {
++                m.write(&mut Cx::new(&mut h, 0, 0, 0), ADDRESS, 4, 1);
++            }
++            if phase == 1 {
++                h.now = 8;
++                m.advance(&mut Cx::new(&mut h, 0, 0, 0));
++            }
++        }
++        let mut m = AudioResetFixture::new(8).unwrap();
++        h.now = u64::MAX - 7;
++        refused(&mut m, &mut h, ADDRESS, 4, Some(1));
++    }
++
++    #[test]
++    fn audio_reset_fixture_checkpoint_restores_pending_deadline_without_early_completion() {
++        let mut m = AudioResetFixture::new(8).unwrap();
++        let mut h = Clock {
++            now: 100,
++            ..Default::default()
++        };
++        let idle = m.checkpoint().unwrap();
++        m.write(&mut Cx::new(&mut h, 0, 0, 0), ADDRESS, 4, 1);
++        let pending = m.checkpoint().unwrap();
++        let mut restored = AudioResetFixture::new(8).unwrap();
++        restored.restore_checkpoint(&pending).unwrap();
++        assert_eq!(restored.save(), m.save());
++        assert_eq!(restored.next_deadline(100), Some(108));
++        h.now = 107;
++        restored.advance(&mut Cx::new(&mut h, 3, 0x1234, 0));
++        assert_eq!(restored.save(), m.save());
++        m.restore_checkpoint(&idle).unwrap();
++        h.now = 108;
++        m.event(&mut Cx::new(&mut h, 0, 0, 0), TOKEN);
++        assert_eq!(m.state.stage, Stage::Idle);
++        restored.advance(&mut Cx::new(&mut h, 3, 0x1234, 0));
++        let done = restored.checkpoint().unwrap();
++        m.restore_checkpoint(&done).unwrap();
++        assert_eq!(m.save(), restored.save());
++        assert!(
++            AudioResetFixture::new(9)
++                .unwrap()
++                .validate_checkpoint(&pending)
++                .is_err()
++        );
++        for malformed in 0..6 {
++            let mut bad: State = pending.decode(NAME).unwrap();
++            if let Stage::Pending(ref mut request) = bad.stage {
++                match malformed {
++                    0 => request.command = 0,
++                    1 => request.token = 0,
++                    2 => request.due += 1,
++                    3 => request.started = u64::MAX,
++                    4 => bad.ticks = 0,
++                    _ => request.token = 2,
++                }
++            }
++            let before = m.save();
++            assert!(
++                m.restore_checkpoint(&Checkpoint::encode(NAME, &bad).unwrap())
++                    .is_err()
++            );
++            assert_eq!(m.save(), before);
++        }
++        let attached = pending.clone().with_children(vec![idle]);
++        assert!(m.validate_checkpoint(&attached).is_err());
++        let attached = pending.with_blobs(vec![vec![1u8].into()]);
++        assert!(m.validate_checkpoint(&attached).is_err());
++        assert!(
++            m.validate_checkpoint(&Checkpoint::encode("other-device", &m.state).unwrap())
++                .is_err()
++        );
++        let invalid = serde_json::json!({"ticks":8,"stage":"Unknown"});
++        assert!(
++            m.validate_checkpoint(&Checkpoint::encode(NAME, &invalid).unwrap())
++                .is_err()
++        );
++    }
++
++    fn two_commands(core: usize, pc: u64, polls: usize) -> (serde_json::Value, Vec<Record>) {
++        let mut m = AudioResetFixture::new_with_second_command(8).unwrap();
++        let mut h = Clock::default();
++        for ordinal in 1..=2u64 {
++            h.now = ordinal * 100;
++            let due = h.now + 8;
++            let mut cx = Cx::new(&mut h, core, pc, 0);
++            m.write(&mut cx, ADDRESS, 4, 1);
++            assert!(cx.refusal().is_none());
++            assert_eq!(m.next_deadline(h.now), Some(due));
++            let pending = m.save();
++            let events = h.events.clone();
++            let records = h.records.clone();
++            for now in [due - 1, due] {
++                h.now = now;
++                let mut cx = Cx::new(&mut h, 3 - core, pc + 4, 0);
++                m.write(&mut cx, ADDRESS, 4, 1);
++                assert!(cx.refusal().is_none());
++                for _ in 0..polls {
++                    assert_eq!(m.read(&mut Cx::new(&mut h, core, pc, 0), ADDRESS, 4), 1);
++                }
++                for token in [0, 3, 3 - ordinal] {
++                    m.event(&mut Cx::new(&mut h, core, pc, 0), token);
++                }
++                if now < due {
++                    m.event(&mut Cx::new(&mut h, core, pc, 0), ordinal);
++                    m.advance(&mut Cx::new(&mut h, core, pc, 0));
++                }
++                assert_eq!(m.save(), pending);
++                assert_eq!(h.events, events);
++                assert_eq!(h.records, records);
++            }
++            m.advance(&mut Cx::new(&mut h, core, pc, 0));
++            assert_eq!(m.read(&mut Cx::new(&mut h, core, pc, 0), ADDRESS, 4), 0);
++            assert_eq!(m.next_deadline(due), None);
++            let completed = m.save();
++            let records = h.records.clone();
++            m.event(&mut Cx::new(&mut h, core, pc, 0), ordinal);
++            assert_eq!(m.save(), completed);
++            assert_eq!(h.records, records);
++        }
++        assert_eq!(h.events, [(108, 1), (208, 2)]);
++        assert_eq!(h.records.len(), 4);
++        for (index, record) in h.records.iter().enumerate() {
++            let (name, value) = record.fields.last().unwrap();
++            assert_eq!(name.as_ref(), "ordinal");
++            assert_eq!(value, &Field::int((index / 2 + 1) as u64));
++        }
++        refused(&mut m, &mut h, ADDRESS, 4, Some(1));
++        (m.save(), h.records)
++    }
++
++    #[test]
++    fn opt_in_two_commands_keep_independent_deadlines_and_reject_stale_tokens_and_third() {
++        assert_eq!(two_commands(0, 0x1000, 1), two_commands(3, 0xdead0000, 40));
++    }
++
++    #[test]
++    fn second_command_deadline_overflow_preserves_first_completion() {
++        for ticks in [0, 1_000_001, u64::MAX] {
++            assert!(AudioResetFixture::new_with_second_command(ticks).is_err());
++        }
++        assert!(AudioResetFixture::new_with_second_command(1).is_ok());
++        assert!(AudioResetFixture::new_with_second_command(1_000_000).is_ok());
++        let mut m = AudioResetFixture::new_with_second_command(8).unwrap();
++        let mut h = Clock::default();
++        m.write(&mut Cx::new(&mut h, 0, 0, 0), ADDRESS, 4, 1);
++        h.now = 8;
++        m.advance(&mut Cx::new(&mut h, 0, 0, 0));
++        h.now = u64::MAX - 7;
++        refused(&mut m, &mut h, ADDRESS, 4, Some(1));
++        h.now = u64::MAX - 8;
++        m.write(&mut Cx::new(&mut h, 0, 0, 0), ADDRESS, 4, 1);
++        assert_eq!(h.events, [(8, 1), (u64::MAX, 2)]);
++        let pending = m.save();
++        h.now = u64::MAX - 1;
++        m.advance(&mut Cx::new(&mut h, 0, 0, 0));
++        h.now = u64::MAX;
++        m.event(&mut Cx::new(&mut h, 0, 0, 0), 1);
++        assert_eq!(m.save(), pending);
++        m.advance(&mut Cx::new(&mut h, 0, 0, 0));
++        assert_eq!(m.read(&mut Cx::new(&mut h, 0, 0, 0), ADDRESS, 4), 0);
++        refused(&mut m, &mut h, ADDRESS, 4, Some(1));
++    }
++
++    #[test]
++    fn legacy_omitted_flag_json_and_checkpoint_bytes_stay_compatible_and_policies_isolate() {
++        #[derive(Serialize)]
++        struct LegacyState {
++            ticks: u64,
++            stage: Stage,
++        }
++        let request = Request {
++            command: 1,
++            started: 100,
++            due: 108,
++            token: TOKEN,
++        };
++        for stage in [Stage::Idle, Stage::Pending(request), Stage::Done(request)] {
++            let legacy = LegacyState { ticks: 8, stage };
++            let saved = Checkpoint::encode(NAME, &legacy).unwrap();
++            let mut m = AudioResetFixture::new(8).unwrap();
++            m.restore_checkpoint(&saved).unwrap();
++            assert_eq!(
++                serde_json::to_vec(&m.state).unwrap(),
++                serde_json::to_vec(&legacy).unwrap()
++            );
++            assert_eq!(
++                serde_json::to_vec(&m.checkpoint().unwrap()).unwrap(),
++                serde_json::to_vec(&saved).unwrap()
++            );
++            assert!(m.save().get("allow_second_command").is_none());
++            let mut two = AudioResetFixture::new_with_second_command(8).unwrap();
++            let before = two.save();
++            assert!(two.restore_checkpoint(&saved).is_err());
++            assert_eq!(two.save(), before);
++            let before = m.save();
++            assert!(m.restore_checkpoint(&two.checkpoint().unwrap()).is_err());
++            assert_eq!(m.save(), before);
++        }
++        let legacy_second = LegacyState {
++            ticks: 8,
++            stage: Stage::Pending(Request {
++                token: 2,
++                ..request
++            }),
++        };
++        let mut m = AudioResetFixture::new(8).unwrap();
++        let before = m.save();
++        assert!(
++            m.restore_checkpoint(&Checkpoint::encode(NAME, &legacy_second).unwrap())
++                .is_err()
++        );
++        assert_eq!(m.save(), before);
++    }
++
++    #[test]
++    fn second_pending_checkpoint_restores_generation_and_rejects_invalid_state_atomically() {
++        let mut m = AudioResetFixture::new_with_second_command(8).unwrap();
++        let mut h = Clock {
++            now: 100,
++            ..Default::default()
++        };
++        m.write(&mut Cx::new(&mut h, 0, 0, 0), ADDRESS, 4, 1);
++        h.now = 108;
++        m.advance(&mut Cx::new(&mut h, 0, 0, 0));
++        h.now = 200;
++        m.write(&mut Cx::new(&mut h, 0, 0, 0), ADDRESS, 4, 1);
++        let pending = m.checkpoint().unwrap();
++        let mut restored = AudioResetFixture::new_with_second_command(8).unwrap();
++        restored.restore_checkpoint(&pending).unwrap();
++        assert_eq!(restored.save(), m.save());
++        assert_eq!(restored.next_deadline(200), Some(208));
++        h.now = 207;
++        restored.advance(&mut Cx::new(&mut h, 3, 0x1234, 0));
++        assert_eq!(restored.save(), m.save());
++        h.now = 208;
++        restored.event(&mut Cx::new(&mut h, 3, 0x1234, 0), 1);
++        assert_eq!(restored.save(), m.save());
++        assert_eq!(
++            restored.read(&mut Cx::new(&mut h, 3, 0x1234, 0), ADDRESS, 4),
++            1
++        );
++        restored.advance(&mut Cx::new(&mut h, 3, 0x1234, 0));
++        m.restore_checkpoint(&restored.checkpoint().unwrap())
++            .unwrap();
++        assert_eq!(m.save(), restored.save());
++        refused(&mut m, &mut h, ADDRESS, 4, Some(1));
++        let mut unknown_request = pending.decode::<serde_json::Value>(NAME).unwrap();
++        unknown_request["stage"]["Pending"]["extra"] = serde_json::json!(1);
++        let mut invalid = vec![
++            pending
++                .clone()
++                .with_children(vec![restored.checkpoint().unwrap()]),
++            pending.clone().with_blobs(vec![vec![1u8].into()]),
++            Checkpoint::encode("other-device", &m.state).unwrap(),
++            Checkpoint::encode(NAME, &unknown_request).unwrap(),
++            Checkpoint::encode(
++                NAME,
++                &serde_json::json!({"ticks": 8, "stage": "Unknown", "allow_second_command": true}),
++            )
++            .unwrap(),
++        ];
++        for malformed in 0..7 {
++            let mut bad: State = pending.decode(NAME).unwrap();
++            if let Stage::Pending(ref mut request) = bad.stage {
++                match malformed {
++                    0 => request.command = 0,
++                    1 => request.token = 0,
++                    2 => request.token = 3,
++                    3 => request.due += 1,
++                    4 => request.started = u64::MAX,
++                    5 => bad.ticks = 9,
++                    _ => bad.allow_second_command = false,
++                }
++            }
++            invalid.push(Checkpoint::encode(NAME, &bad).unwrap());
++        }
++        for saved in invalid {
++            let before = m.save();
++            assert!(m.restore_checkpoint(&saved).is_err());
++            assert_eq!(m.save(), before);
++        }
++    }
++}

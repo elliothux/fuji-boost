@@ -1,0 +1,68 @@
+.camera-page { min-height: 100svh; background: radial-gradient(ellipse at 47% 40%, #e6e5df, #f4f3ef 70%); color: #444744; padding: 38px 3vw 20px; }
+.camera-heading { max-width: 1240px; margin: 0 auto; display: flex; align-items: baseline; gap: 14px; }
+.camera-heading > span { font-size: 12px; font-weight: 750; letter-spacing: .16em; }
+.camera-heading h1 { font-size: 27px; font-weight: 450; letter-spacing: -.04em; margin: 0; }
+.camera-heading p { margin: 0 0 0 auto; color: #868780; font-size: 12px; }
+.camera-stage { max-width: 1280px; margin: 24px auto 0; display: flex; align-items: center; gap: 24px; }
+.camera-body { width: min(100%, 1100px); aspect-ratio: 10 / 7; position: relative; flex: 1; filter: drop-shadow(0 28px 20px #242b2924); min-width: 0; }
+.body-drawing { position: absolute; inset: 0; width: 100%; height: 100%; }
+.camera-lcd { position: absolute; left: 12.7%; top: 39.2857143%; width: 54%; height: 51.4285714%; object-fit: contain; background: #070808; }
+.camera-lcd.touchable { cursor: pointer; touch-action: none; user-select: none; }
+.body-key { position: absolute; display: flex; align-items: center; justify-content: center; border: 1px solid #0c0d0e; border-radius: 50%; background: linear-gradient(#343739, #181a1c); box-shadow: inset 0 1px 1px #686c6e70, 0 2px 3px #000a; color: #dddeda; font-size: clamp(5px, .72vw, 10px); line-height: 1.1; font-weight: 600; padding: 0; touch-action: none; user-select: none; }
+.body-key:hover:not(:disabled) { background: linear-gradient(#4b5052, #24282b); }
+.body-key:active:not(:disabled) { box-shadow: inset 0 2px 5px #000; transform: translateY(1px); color: white; }
+.camera-body :focus-visible { outline: 2px solid #eeae73; outline-offset: 3px; }
+.camera-body button:disabled { cursor: default; }
+.body-dial { position: absolute; color: #d4d5d1; text-align: center; user-select: none; }
+.dial-caption { display: block; font-size: clamp(5px, .65vw, 9px); letter-spacing: .12em; margin-bottom: 6%; color: #969b9b; }
+.body-dial [role=slider] { height: 76%; border-radius: 40%; border: 2px solid #101213; background: repeating-linear-gradient(90deg, #141617 0px, #141617 2px, #444749 3px, #282a2c 5px); box-shadow: inset 0 7px 5px #72787b40, 0 5px 3px #000b; display: flex; align-items: center; justify-content: space-around; cursor: ew-resize; touch-action: none; font-size: clamp(9px, 1.3vw, 18px); }
+.body-dial strong { padding: 4% 10%; background: #26292a; border-radius: 30%; font-weight: 600; text-shadow: 0 1px 2px black; }
+.body-dial [role=slider] > span { color: #929797; font-size: 13px; }
+.drive-ring .dial-caption { position: absolute; left: 0; top: 90%; font-size: clamp(5px, .52vw, 7px); width: 100%; margin: 0; }
+.drive-ring [role=slider] { height: 80%; border-radius: 5px; font-size: clamp(7px, .9vw, 12px); }
+.body-switch { position: absolute; display: flex; background: #111314; border: 1px solid #101112; padding: 2px; border-radius: 5px; gap: 1px; }
+.body-switch button { flex: 1; padding: 0; color: #9a9e9d; font-size: clamp(5px, .62vw, 9px); border-radius: 3px; }
+.body-switch button[aria-pressed=true] { color: #eee; background: #414648; box-shadow: 0 1px 3px #000; }
+.selector-ring { position: absolute; border-radius: 50%; background: radial-gradient(#101112 47%, #303436 48%, #191b1d 65%, #0c0d0e 67%, #343739 70%, #111 72%); box-shadow: 0 3px 4px #0008; }
+.command-dial { position: absolute; }
+.command-dial button { display: block; border-radius: 6px; background: repeating-linear-gradient(90deg, #090a0b 0px, #090a0b 2px, #44484a 3px, #17191a 5px); color: #777b7b; width: 100%; height: 100%; overflow: hidden; border: 1px solid #080909; font-size: 0; }
+.command-dial small { position: absolute; top: 100%; right: 0; color: #777d7c; font-size: clamp(5px, .55vw, 8px); }
+.focus-stick { position: absolute; border-radius: 50%; background: radial-gradient(#585c5c, #121415 75%); display: grid; grid-template: repeat(3, 1fr) / repeat(3, 1fr); padding: .3%; box-shadow: 0 2px 4px #000a; }
+.focus-stick button { color: #979d9c; padding: 0; font-size: clamp(5px, .55vw, 9px); touch-action: none; }
+.focus-stick .stick-up { grid-area: 1 / 2; }.focus-stick .stick-left { grid-area: 2 / 1; }.focus-stick .stick-press { grid-area: 2 / 2; border-radius: 50%; background: #2f3435; }.focus-stick .stick-right { grid-area: 2 / 3; }.focus-stick .stick-down { grid-area: 3 / 2; }
+.scene-picker { width: 130px; flex-shrink: 0; font-size: 11px; color: #777b75; align-self: center; }
+.scene-picker > span { display: block; margin-bottom: 12px; letter-spacing: .15em; }
+.scene-picker [role=group] { display: flex; flex-wrap: wrap; border: 1px solid #d0d2ca; border-radius: 7px; padding: 3px; background: #e8e9e2; }
+.scene-picker button { width: 50%; padding: 9px 0; border-radius: 4px; color: #7e817a; }
+.scene-picker button[aria-pressed=true] { background: #fff; color: #343b34; box-shadow: 0 1px 3px #2222; }
+.scene-picker button:disabled { opacity: .5; }
+.scene-picker p { font-size: 10px; line-height: 1.9; margin-top: 16px; color: #93978f; }
+.camera-status { text-align: center; font-size: 11px; font-variant-numeric: tabular-nums; color: #8b8f86; min-height: 17px; }
+.camera-files { display: flex; flex-wrap: wrap; justify-content: center; align-items: center; gap: 10px; font-size: 12px; margin: 16px auto; }
+.camera-files label { border-bottom: 1px solid #777; cursor: pointer; }
+.camera-files input { display: none; }
+.camera-error { text-align: center; color: #a14833; font-size: 12px; max-width: 800px; margin: 12px auto; overflow-wrap: anywhere; }
+.camera-footer { max-width: 1240px; margin: 28px auto 0; padding-top: 16px; border-top: 1px solid #dfe0d9; display: flex; justify-content: space-between; font-size: 10px; color: #95998f; letter-spacing: .06em; }
+
+@media (max-width: 760px) { .camera-page { padding: 22px 6px 16px; }.camera-heading { padding: 0 16px; }.camera-heading p { display: none; }.camera-stage { flex-direction: column; gap: 5px; margin-top: 34px; }.camera-body { width: 100%; flex: auto; }.scene-picker { width: auto; display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 0 16px; }.scene-picker > span { margin: 0; }.scene-picker [role=group] { flex-wrap: nowrap; }.scene-picker button { width: auto; padding: 6px 14px; }.scene-picker p { display: none; }.camera-status { margin-top: 18px; }.camera-footer { margin-left: 16px; margin-right: 16px; }.body-key { font-size: 1.05vw; }.dial-caption { font-size: 1vw; }.body-dial [role=slider] { font-size: 1.8vw; }.drive-ring [role=slider] { font-size: 1.3vw; }.body-switch button { font-size: 1vw; } }
+.command-dial button:not(:disabled) { font-size: clamp(8px, .8vw, 12px); color: #d6d9d9; cursor: ew-resize; touch-action: none; }
+.scene-picker > span:not(:first-child) { margin-top: 22px; }
+.scene-picker .firmware-picker button { width: 100%; padding: 8px 10px; text-align: left; line-height: 1.35; }
+.firmware-debug { max-width: 1240px; margin: 18px auto 0; display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1.3fr) minmax(0, .75fr); gap: 20px; font-size: 11px; color: #5d615b; }
+.firmware-debug h2 { font-size: 11px; font-weight: 600; letter-spacing: .12em; margin: 16px 0 8px; color: #7a7e77; }
+.firmware-debug h2 span, .firmware-debug h2 small { margin-left: 8px; letter-spacing: 0; font-weight: 500; color: #3f443e; }
+.firmware-debug h2 small { color: #9a9e95; }
+.firmware-debug .debug-stopped { color: #a14833; }
+.debug-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.debug-actions button, .debug-button, .debug-apps button { padding: 5px 11px; border-radius: 6px; border: 1px solid #d0d2ca; background: #fff; color: #3f443e; cursor: pointer; }
+.debug-actions button:disabled, .debug-button.disabled, .debug-apps button:disabled { opacity: .45; cursor: default; }
+.debug-actions label:not(.debug-button), .debug-apps label { display: flex; align-items: center; gap: 6px; }
+.debug-words { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 3px 16px; margin: 0; font-variant-numeric: tabular-nums; }
+.debug-words div { display: flex; justify-content: space-between; gap: 8px; border-bottom: 1px dotted #dcddd5; }
+.debug-words dt { color: #8b8f86; }
+.debug-words dd { margin: 0; color: #2f342e; overflow-wrap: anywhere; text-align: right; }
+.debug-log { margin: 0; height: 340px; overflow: auto; background: #1a1c1d; color: #c7f0dc; border-radius: 8px; padding: 10px 12px; font-size: 10.5px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+.debug-apps > div { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+.debug-apps button[aria-pressed=true] { background: #343b34; border-color: #343b34; color: #fff; }
+.debug-apps p { color: #8b8f86; line-height: 1.6; margin: 10px 0 0; }
+@media (max-width: 760px) { .firmware-debug { grid-template-columns: 1fr; padding: 0 16px; } }

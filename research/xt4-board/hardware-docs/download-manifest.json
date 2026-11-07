@@ -1,0 +1,15 @@
+[
+  {
+    "file": "rl78g13-hardware.pdf",
+    "url": "https://www.renesas.com/en/document/man/rl78g13-users-manual-hardware?language=en",
+    "resolved_url": "https://www.renesas.com/en/document/man/rl78g13-users-manual-hardware?language=en",
+    "bytes": 11296482,
+    "sha256": "f25502674005c6e9f06241ab8348c15698336eea1361d8d5b87dd6b65bb1a2f9",
+    "retrieved_date": "2026-10-28"
+  },
+  {
+    "file": "max77812.pdf",
+    "url": "https://www.analog.com/media/en/technical-documentation/data-sheets/max77812.pdf",
+    "error": "The read operation timed out"
+  }
+]

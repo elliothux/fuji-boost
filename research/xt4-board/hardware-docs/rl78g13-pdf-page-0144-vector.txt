@@ -1,0 +1,31 @@
+ 
+RL78/G13  CHAPTER  3   CPU ARCHITECTURE 
+R01UH0146EJ0380  Rev.3.80   121  
+Oct 31, 2024 
+3.1.1  Internal program memory space 
+The internal program memory space stores the program and table data. 
+The RL78/G13 products incorporate internal ROM (flash memory), as shown below. 
+ 
+Table 3-2.  Internal ROM Capacity 
+Part Number Internal ROM 
+Structure Capacity 
+R5F100xA, R5F101xA (x = 6 to 8, A to C, E to G) Flash memory 16384 × 8 bits (00000H to 03FFFH) 
+R5F100xC, R5F101xC (x = 6 to 8, A to C, E to G, J, L) 32768 × 8 bits (00000H to 07FFFH) 
+R5F100xD, R5F101xD (x = 6 to 8, A to C, E to G, J, L) 49152 × 8 bits (00000H to 0BFFFH) 
+R5F100xE, R5F101xE (x = 6 to 8, A to C, E to G, J, L) 65536 × 8 bits (00000H to 0FFFFH) 
+R5F100xF, R5F101xF (x = A to C, E to G, J, L, M, P) 98304 × 8 bits (00000H to 17FFFH) 
+R5F100xG, R5F101xG (x = A to C, E to G, J, L, M, P) 131072 × 8 bits (00000H to 1FFFFH) 
+R5F100xH, R5F101xH (x = E to G, J, L, M, P, S) 196608 × 8 bits (00000H to 2FFFFH) 
+R5F100xJ, R5F101xJ (x = F, G, J, L, M, P, S) 262144 × 8 bits (00000H to 3FFFFH) 
+R5F100xK, R5F101xK (x = F, G, J, L, M, P, S) 393216 × 8 bits (00000H to 5FFFFH) 
+R5F100xL, R5F101xL (x = F, G, J, L, M, P, S) 524288 × 8 bits (00000H to 7FFFFH) 
+ 
+The internal program memory space is divided into the following areas. 
+ 
+(1) Vector table area 
+The 128-byte area 00000H to 0007FH is reserved as a ve ctor table area.  The program start addresses for branch 
+upon reset or generation of each interrupt request are stored in the vector table area.  Furthermore, the interrupt jump 
+address is a 64 K address of 00000H to 0FFFFH, because the vector code is assumed to be 2 bytes. 
+Of the 16-bit address, the lower 8 bits are stored at even addresses and the higher 8 bits are stored at odd addresses. 
+To use the boot swap function, set a vector table also at 01000H to 0107FH. 
+ 

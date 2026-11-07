@@ -1,0 +1,3884 @@
+diff --git a/crates/emulator-xp4-board/src/definition.rs b/crates/emulator-xp4-board/src/definition.rs
+--- a/crates/emulator-xp4-board/src/definition.rs
++++ b/crates/emulator-xp4-board/src/definition.rs
+@@ -101,6 +101,8 @@
+     pub usb: Option<(u64, u32, u64, u64, u8)>,
+     #[serde(default)]
+     pub usb_phy: Option<(u64, [u8; 32], u32)>,
++    #[serde(default)]
++    pub banked_calibration_fixture: Option<BankedFixtureConfig>,
+ }
+ 
+ /// Register layout of the interval timer at `timer_base`.
+diff --git a/crates/emulator-xp4-board/src/devices.rs b/crates/emulator-xp4-board/src/devices.rs
+--- a/crates/emulator-xp4-board/src/devices.rs
++++ b/crates/emulator-xp4-board/src/devices.rs
+@@ -199,6 +199,17 @@
+         let id = self.models.len();
+         self.models.push(Some(Box::new(model)));
+         self.windows.extend(ranges.map(|(a, b)| (a, b, id)));
++        Ok(())
++    }
++    pub fn banked_calibration_fixture(&mut self, config: super::BankedFixtureConfig) -> Result<(), String> {
++        let ranges = [(0xff500000, 0xff540000), (0xff600000, 0xff640000)];
++        if ranges.iter().any(|&(a,b)| self.windows.iter().any(|&(lo,hi,_)| a < hi && lo < b)) {
++            return Err("Overlapping banked calibration fixture wiring".into());
++        }
++        let model = fujimod_emulator_xp4_io::banked_calibration::BankedCalibration::new(config)?;
++        let id = self.models.len();
++        self.models.push(Some(Box::new(model)));
++        self.windows.extend(ranges.map(|(a,b)| (a,b,id)));
+         Ok(())
+     }
+     pub fn power_spi(
+diff --git a/crates/emulator-xp4-board/src/lib.rs b/crates/emulator-xp4-board/src/lib.rs
+--- a/crates/emulator-xp4-board/src/lib.rs
++++ b/crates/emulator-xp4-board/src/lib.rs
+@@ -5,6 +5,7 @@
+ mod client;
+ mod definition;
+ pub use definition::Definition;
++pub use fujimod_emulator_xp4_io::banked_calibration::{Config as BankedFixtureConfig, Mode2 as BankedMode2Config, Reprogram as BankedReprogramConfig};
+ pub mod observation;
+ use observation::Call;
+ mod devices;
+@@ -953,6 +954,7 @@
+             instructions_per_tick,
+             usb,
+             usb_phy,
++            banked_calibration_fixture,
+         } = definition;
+         let instruction_rate = fujimod_emulator_cpu::timeline::Ratio::new(
+             instructions_per_tick.0,
+@@ -1101,6 +1103,9 @@
+             devices
+                 .get_or_insert_with(devices::Devices::empty)
+                 .temperature(value, ticks)?;
++        }
++        if let Some(config) = banked_calibration_fixture {
++            devices.get_or_insert_with(devices::Devices::empty).banked_calibration_fixture(config)?;
+         }
+         if let Some((base, idle, port, pin, high, inputs, rtc_ticks)) = power_spi {
+             devices
+diff --git a/crates/emulator-xp4-io/src/lib.rs b/crates/emulator-xp4-io/src/lib.rs
+--- a/crates/emulator-xp4-io/src/lib.rs
++++ b/crates/emulator-xp4-io/src/lib.rs
+@@ -1,5 +1,6 @@
+ //! XP4 power serial links, SPI, ADC, RTC, timers, requests, temperature and USB PHY.
+ pub mod adc;
++pub mod banked_calibration;
+ pub mod checksum_power_serial;
+ pub mod interval_timers;
+ pub mod power_serial;
+diff --git a/crates/emulator-xp4-io/src/banked_calibration.rs b/crates/emulator-xp4-io/src/banked_calibration.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/emulator-xp4-io/src/banked_calibration.rs
+@@ -0,0 +1,3807 @@
++//! Explicit synthetic, single cold initialization, mode5 and removal of each bank pair.
++//! Results and latency are fixture inputs, not measured calibration or PHY laws.
++use fujimod_emulator_devices::{Cx, Device, Record, Value as Field, checkpoint::Checkpoint};
++use serde::{Deserialize, Serialize};
++use std::collections::{BTreeMap, BTreeSet};
++
++const NAME: &str = "xp4-banked-calibration-fixture";
++const FINAL: [(u32, u32); 3] = [(0x7c20, 0x40000520), (0x7c40, 0), (0x7084, 0x02010200)];
++
++#[derive(Clone, Debug, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct Config {
++    pub initial_script: Vec<(u32, u32)>,
++    pub preparation: Vec<(u32, u32)>,
++    pub profile: Vec<(u32, u32)>,
++    pub results: [[u16; 4]; 4],
++    pub latency_ticks: u64,
++    pub source_sha256: String,
++    /// Original absolute (address, value) pairs for each unit, in firmware order.
++    pub mode5_scripts: [Vec<(u32, u32)>; 4],
++    /// SHA256 of unit0..3 pairs concatenated as two little-endian u32 words.
++    pub mode5_sha256: String,
++    pub removal_script: Vec<(u32, u32)>,
++    /// Offset, command, status offset, mask, expected; original five u32 words.
++    pub removal_poll: [u32; 5],
++    /// SHA256 of three offset/value pairs then removal_poll, all u32 LE.
++    pub removal_sha256: String,
++    pub unit0_preinitialized: bool,
++    #[serde(default)]
++    pub mode2: Option<Mode2>,
++    #[serde(default)]
++    pub reprogram: Option<Reprogram>,
++    #[serde(default)]
++    pub post_control_source_sha256: Option<String>,
++    #[serde(default)]
++    pub post_mode2_source_sha256: Option<String>,
++    #[serde(default)]
++    pub selector1_source_sha256: Option<String>,
++}
++
++#[derive(Clone, Debug, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct Mode2 {
++    pub scripts: [Vec<(u32, u32)>; 4],
++    pub source_sha256: String,
++}
++
++/// Explicit virtual inputs for one Removed-to-reprogram lifecycle per selected unit.
++#[derive(Clone, Debug, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct Reprogram {
++    pub profile: Vec<(u32, u32)>,
++    pub cached: [Option<[u32; 6]>; 4],
++    pub input_sha256: String,
++}
++
++const REPROGRAM_SUPPLEMENT: [(u32, u32); 6] = [
++    (0x2020, 4),
++    (0x4660, 0x03000004),
++    (0x46dc, 0x20050108),
++    (0x2000, 0xb01),
++    (0x4610, 0x04000300),
++    (0x227c, 0x01000000),
++];
++const REPROGRAM_RMW: [(u32, u32); 6] = [
++    (0x4660, 0x07ff0000),
++    (0x4664, 0x7ff),
++    (0x4480, 0x7ff00),
++    (0x4484, 0x07ff07ff),
++    (0x4488, 0x07ff07ff),
++    (0x448c, 0x7ff),
++];
++const REPROGRAM_PAIRED: [(u32, u32); 4] =
++    [(0x710c, 1), (0x7114, 0), (0x7c40, 0x80000000), (0x7c14, 0)];
++
++const POST_CONTROL: [(u32, u32); 8] = [
++    (0x7c50, 1),
++    (0x7080, 0x200),
++    (0x7c50, 0),
++    (0x7360, 0xff00c00d),
++    (0x7364, 1),
++    (0x7c20, 0x40000520),
++    (0x7c40, 0),
++    (0x7084, 0x02010200),
++];
++
++const SELECTOR1: [(u32, u32); 3] = [(0x5038, 0x03204020), (0x5438, 0x83), (0x5384, 1)];
++
++impl Reprogram {
++    fn hash(&self) -> String {
++        let mask = self
++            .cached
++            .iter()
++            .enumerate()
++            .fold(0u32, |m, (i, c)| m | if c.is_some() { 1 << i } else { 0 });
++        let bytes: Vec<_> = mask
++            .to_le_bytes()
++            .into_iter()
++            .chain(
++                self.profile
++                    .iter()
++                    .flat_map(|(o, v)| o.to_le_bytes().into_iter().chain(v.to_le_bytes())),
++            )
++            .chain(
++                self.cached
++                    .iter()
++                    .flatten()
++                    .flatten()
++                    .flat_map(|v| v.to_le_bytes()),
++            )
++            .collect();
++        fujimod_emulator_devices::fingerprint::bytes(&bytes)["sha256"]
++            .as_str()
++            .unwrap()
++            .into()
++    }
++}
++
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Identity {
++    source_sha256: String,
++    mode5_sha256: String,
++    removal_sha256: String,
++    results: [[u16; 4]; 4],
++    latency_ticks: u64,
++    unit0_preinitialized: bool,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    mode2_sha256: Option<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    reprogram_sha256: Option<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    post_control_source_sha256: Option<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    post_mode2_source_sha256: Option<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    selector1_source_sha256: Option<String>,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
++enum Action {
++    Pll,
++    Clear3,
++    Clear10,
++    Controller,
++    Finalize,
++    Mode5,
++    Mode2,
++    Removal,
++    ReprogramClear,
++    ReprogramReady,
++    ReprogramPll,
++    PostPll,
++    PostClear,
++    PostController,
++    PostFinalize,
++    PostMode2,
++    Selector1(bool),
++}
++impl Action {
++    fn command(self) -> (bool, u32, u32) {
++        match self {
++            Self::Pll => (true, 0x7c18, 0x40000000),
++            Self::Clear3 => (true, 0x7040, 3),
++            Self::Clear10 => (true, 0x7040, 0x10),
++            Self::Controller => (false, 0x2000, 0xb01),
++            Self::Finalize => (true, 0x7360, 0xff00c00d),
++            Self::Mode5 | Self::Mode2 | Self::PostMode2 | Self::Selector1(_) => (true, 0x5384, 1),
++            Self::Removal | Self::ReprogramReady => (true, 0x7080, 0x100),
++            Self::ReprogramClear => (true, 0x7040, 0x100),
++            Self::ReprogramPll => (true, 0x7c18, 0x40000000),
++            Self::PostPll => (true, 0x7c50, 1),
++            Self::PostClear => (true, 0x7080, 0x200),
++            Self::PostController => (true, 0x7c50, 0),
++            Self::PostFinalize => (true, 0x7360, 0xff00c00d),
++        }
++    }
++    fn label(self) -> &'static str {
++        match self {
++            Self::Pll => "paired-kick",
++            Self::Clear3 => "paired-command3",
++            Self::Clear10 => "paired-command10",
++            Self::Controller => "controller",
++            Self::Finalize => "finalization",
++            Self::Mode5 => "mode5",
++            Self::Mode2 => "mode2",
++            Self::Removal => "removal",
++            Self::ReprogramClear => "reprogram-clear",
++            Self::ReprogramReady => "reprogram-ready",
++            Self::ReprogramPll => "reprogram-pll",
++            Self::PostPll => "post-control-pll",
++            Self::PostClear => "post-control-clear",
++            Self::PostController => "post-control-controller",
++            Self::PostFinalize => "post-control-finalization",
++            Self::PostMode2 => "post-mode2",
++            Self::Selector1(_) => "selector1",
++        }
++    }
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
++enum Stage {
++    Initial(usize),
++    Kick,
++    Pending(Action),
++    Preparation(usize),
++    Profile(usize),
++    Command3,
++    Command10,
++    Controller,
++    Quality,
++    Acknowledge,
++    FinalWrites(usize),
++    Complete,
++    Mode5(usize),
++    Mode5Done,
++    Mode2(usize),
++    Mode2Done,
++    Removal(usize),
++    Removed,
++    Reprogram(usize),
++    ReprogramDone,
++    PostControl(usize),
++    PostControlDone,
++    PostMode2(usize),
++    PostMode2Done,
++    Selector1(usize, bool),
++    Selector1Done(bool),
++}
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Pending {
++    action: Action,
++    started: u64,
++    due: u64,
++    token: u64,
++}
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Unit {
++    stage: Stage,
++    primary: BTreeMap<u32, u32>,
++    paired: BTreeMap<u32, u32>,
++    pending: Option<Pending>,
++}
++impl Unit {
++    fn empty() -> Self {
++        Self {
++            stage: Stage::Initial(0),
++            primary: BTreeMap::new(),
++            paired: BTreeMap::new(),
++            pending: None,
++        }
++    }
++    fn pll_done(&mut self) {
++        for (offset, mask) in [(0x4670, 0x30000), (0x4674, 0x30003), (0x4678, 0x30003)] {
++            *self.primary.get_mut(&offset).unwrap() |= mask;
++        }
++        self.paired.insert(0x7c18, 1);
++    }
++    fn controller_done(&mut self, results: [u16; 4]) {
++        *self.primary.get_mut(&0x2110).unwrap() |= 1;
++        for offset in [0x40dc, 0x42dc] {
++            let v = self.primary.get_mut(&offset).unwrap();
++            *v = (*v & !0x1300) | 0x300;
++        }
++        for (offset, low, high) in [
++            (0x444c, results[0], results[1]),
++            (0x4620, results[2], results[3]),
++        ] {
++            let v = self.primary.get_mut(&offset).unwrap();
++            *v = (*v & !0x07ff07ff) | u32::from(low) | (u32::from(high) << 16);
++        }
++    }
++}
++#[derive(Clone, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct State {
++    identity: Identity,
++    units: [Unit; 4],
++    generation: u64,
++}
++
++pub struct BankedCalibration {
++    config: Config,
++    state: State,
++    reprogram_plans: [Option<Vec<(bool, u32, u32)>>; 4],
++}
++impl BankedCalibration {
++    pub fn new(config: Config) -> Result<Self, String> {
++        for (script, count) in [
++            (&config.initial_script, 686),
++            (&config.preparation, 7),
++            (&config.profile, 17),
++        ] {
++            if script.len() != count
++                || script.iter().any(|(o, _)| o & 3 != 0 || *o >= 0x10000)
++                || script.iter().map(|(o, _)| o).collect::<BTreeSet<_>>().len() != count
++            {
++                return Err("Invalid banked calibration script extent/alignment/uniqueness".into());
++            }
++        }
++        if !(1..=1_000_000).contains(&config.latency_ticks)
++            || config.results.iter().flatten().any(|v| *v > 0x7ff)
++        {
++            return Err("Invalid banked calibration results or latency".into());
++        }
++        let bytes: Vec<u8> = config
++            .initial_script
++            .iter()
++            .chain(&config.preparation)
++            .chain(&config.profile)
++            .flat_map(|(o, v)| o.to_le_bytes().into_iter().chain(v.to_le_bytes()))
++            .collect();
++        let digest = fujimod_emulator_devices::fingerprint::bytes(&bytes);
++        if digest["sha256"].as_str() != Some(config.source_sha256.as_str()) {
++            return Err("Banked calibration source hash differs from its scripts".into());
++        }
++        for (unit, script) in config.mode5_scripts.iter().enumerate() {
++            let base = 0xff500000 + (unit as u32) * 0x10000;
++            if script.len() != 71 {
++                return Err("Invalid mode5 script length".into());
++            }
++            for (n, &(address, value)) in script.iter().enumerate() {
++                let valid = match n {
++                    0..=22 => address == base + 0x5000 + n as u32 * 4 && value == 0x01004100,
++                    23..=46 => {
++                        address == base + 0x5200 + (n - 23) as u32 * 4
++                            && value <= 7
++                            && (n != 46 || value == 0)
++                    }
++                    47..=69 => address == base + 0x5400 + (n - 47) as u32 * 4 && value == 0x81,
++                    70 => address == base + 0x5384 && value == 1,
++                    _ => false,
++                };
++                if !valid {
++                    return Err("Unsupported mode5 script grammar".into());
++                }
++            }
++        }
++        let bytes: Vec<u8> = config
++            .mode5_scripts
++            .iter()
++            .flatten()
++            .flat_map(|(a, v)| a.to_le_bytes().into_iter().chain(v.to_le_bytes()))
++            .collect();
++        if fujimod_emulator_devices::fingerprint::bytes(&bytes)["sha256"].as_str()
++            != Some(config.mode5_sha256.as_str())
++        {
++            return Err("Mode5 source hash differs from its scripts".into());
++        }
++        if let Some(mode2) = &config.mode2 {
++            for (unit, script) in mode2.scripts.iter().enumerate() {
++                let base = 0xff500000 + unit as u32 * 0x10000;
++                if script.len() != 71 {
++                    return Err("Invalid mode2 script length".into());
++                }
++                for (n, &(address, value)) in script.iter().enumerate() {
++                    let valid = match n {
++                        0..=22 => {
++                            address == base + 0x5000 + n as u32 * 4
++                                && if matches!(unit, 1 | 2) {
++                                    matches!(value, 0x01004100 | 0x05004200 | 0x09004600)
++                                } else {
++                                    value == 0x01004100
++                                }
++                        }
++                        23..=46 => {
++                            address == base + 0x5200 + (n - 23) as u32 * 4
++                                && match unit {
++                                    0 => value <= 7,
++                                    1 | 2 => matches!(value, 0 | 1 | 2 | 5),
++                                    _ => value <= 4,
++                                }
++                                && (n != 46 || value == 0)
++                        }
++                        47..=69 => {
++                            address == base + 0x5400 + (n - 47) as u32 * 4
++                                && match unit {
++                                    0 => value == 0x81,
++                                    1 | 2 => matches!(value, 0x81 | 0x83 | 0xa1),
++                                    _ => matches!(value, 0x81 | 0xa1),
++                                }
++                        }
++                        70 => address == base + 0x5384 && value == 1,
++                        _ => false,
++                    };
++                    if !valid {
++                        return Err("Unsupported mode2 script grammar".into());
++                    }
++                }
++            }
++            let bytes: Vec<u8> = mode2
++                .scripts
++                .iter()
++                .flatten()
++                .flat_map(|(a, v)| a.to_le_bytes().into_iter().chain(v.to_le_bytes()))
++                .collect();
++            if fujimod_emulator_devices::fingerprint::bytes(&bytes)["sha256"].as_str()
++                != Some(mode2.source_sha256.as_str())
++            {
++                return Err("Mode2 source hash differs from its scripts".into());
++            }
++        }
++        if config.removal_script != [(0x7114, 0), (0x7c40, 0x80000000), (0x7c14, 0x80000000)]
++            || config.removal_poll != [0x7080, 0x100, 0x7090, 1, 1]
++        {
++            return Err("Unsupported removal script/poll grammar".into());
++        }
++        let bytes: Vec<u8> = config
++            .removal_script
++            .iter()
++            .flat_map(|(o, v)| o.to_le_bytes().into_iter().chain(v.to_le_bytes()))
++            .chain(config.removal_poll.iter().flat_map(|v| v.to_le_bytes()))
++            .collect();
++        if fujimod_emulator_devices::fingerprint::bytes(&bytes)["sha256"].as_str()
++            != Some(config.removal_sha256.as_str())
++        {
++            return Err("Removal source hash differs from its script/poll".into());
++        }
++        let initial: BTreeMap<_, _> = config.initial_script.iter().copied().collect();
++        for (o, mask, expected) in [
++            (0x2000, u32::MAX, 0xb00),
++            (0x2110, 1, 0),
++            (0x4670, 0x30000, 0),
++            (0x4674, 0x30003, 0),
++            (0x4678, 0x30003, 0),
++            (0x40dc, 0x1300, 0),
++            (0x42dc, 0x1300, 0),
++            (0x444c, 0x07ff07ff, 0),
++            (0x4620, 0x07ff07ff, 0),
++        ] {
++            if initial.get(&o).is_none_or(|v| v & mask != expected) {
++                return Err("Unsupported initial banked calibration control/results".into());
++            }
++        }
++        if config
++            .preparation
++            .iter()
++            .chain(&config.profile)
++            .any(|(o, _)| {
++                [0x7c18, 0x7040, 0x7044, 0x7360, 0x7364].contains(o)
++                    || config.mode5_scripts[0]
++                        .iter()
++                        .any(|(a, _)| a & 0xffff == *o)
++            })
++        {
++            return Err("Configuration script overlaps command/status registers".into());
++        }
++        if config
++            .preparation
++            .iter()
++            .chain(&config.profile)
++            .map(|(o, _)| o)
++            .collect::<BTreeSet<_>>()
++            .len()
++            != 24
++        {
++            return Err("Paired configuration scripts overlap".into());
++        }
++        if let Some(hash) = &config.post_control_source_sha256 {
++            if config.reprogram.is_none()
++                || config.latency_ticks != 8
++                || hash.len() != 64
++                || !hash
++                    .bytes()
++                    .all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(&v))
++            {
++                return Err("Invalid post-control source hash/reprogram dependency/latency".into());
++            }
++        }
++        if let Some(hash) = &config.post_mode2_source_sha256 {
++            if config.reprogram.is_none()
++                || config.post_control_source_sha256.is_none()
++                || config.mode2.is_none()
++                || config.latency_ticks != 8
++                || hash.len() != 64
++                || !hash
++                    .bytes()
++                    .all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(&v))
++            {
++                return Err("Invalid post-mode2 source hash/dependencies/latency".into());
++            }
++        }
++        if let Some(hash) = &config.selector1_source_sha256 {
++            if config.mode2.is_none()
++                || config.latency_ticks != 8
++                || hash.len() != 64
++                || !hash
++                    .bytes()
++                    .all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(&v))
++            {
++                return Err("Invalid selector1 source hash/mode2 dependency/latency".into());
++            }
++        }
++        let mut reprogram_plans: [Option<Vec<(bool, u32, u32)>>; 4] = std::array::from_fn(|_| None);
++        if let Some(r) = &config.reprogram {
++            if config.latency_ticks != 8
++                || r.cached.iter().all(Option::is_none)
++                || r.profile.len() != 17
++                || !r
++                    .profile
++                    .iter()
++                    .map(|(o, _)| o)
++                    .eq(config.profile.iter().map(|(o, _)| o))
++            {
++                return Err("Invalid reprogram targets/profile/latency".into());
++            }
++            if r.hash() != r.input_sha256 {
++                return Err("Reprogram input hash differs from its inputs".into());
++            }
++            let mut primary = initial.clone();
++            primary.extend(REPROGRAM_SUPPLEMENT);
++            for (unit, cached) in r.cached.iter().enumerate() {
++                let Some(cached) = cached else { continue };
++                let mut plan: Vec<_> = config
++                    .initial_script
++                    .iter()
++                    .map(|&(o, v)| (false, o, v))
++                    .chain(config.preparation.iter().map(|&(o, v)| (true, o, v)))
++                    .chain(r.profile.iter().map(|&(o, v)| (true, o, v)))
++                    .chain(REPROGRAM_SUPPLEMENT.into_iter().map(|(o, v)| (false, o, v)))
++                    .collect();
++                for ((off, mask), value) in REPROGRAM_RMW.into_iter().zip(cached) {
++                    let old = primary
++                        .get(&off)
++                        .ok_or("Missing reprogram RMW initial word")?;
++                    plan.push((false, off, (old & !mask) | (value & mask)));
++                }
++                plan.push(Action::ReprogramClear.command());
++                plan.extend(REPROGRAM_PAIRED.into_iter().map(|(o, v)| (true, o, v)));
++                plan.push(Action::ReprogramReady.command());
++                plan.push((true, 0x7c80, 2));
++                plan.push(Action::ReprogramPll.command());
++                debug_assert_eq!(plan.len(), 730);
++                reprogram_plans[unit] = Some(plan);
++            }
++        }
++        let identity = Identity {
++            source_sha256: config.source_sha256.clone(),
++            mode5_sha256: config.mode5_sha256.clone(),
++            removal_sha256: config.removal_sha256.clone(),
++            results: config.results,
++            latency_ticks: config.latency_ticks,
++            unit0_preinitialized: config.unit0_preinitialized,
++            mode2_sha256: config.mode2.as_ref().map(|m| m.source_sha256.clone()),
++            reprogram_sha256: config.reprogram.as_ref().map(|r| r.input_sha256.clone()),
++            post_control_source_sha256: config.post_control_source_sha256.clone(),
++            post_mode2_source_sha256: config.post_mode2_source_sha256.clone(),
++            selector1_source_sha256: config.selector1_source_sha256.clone(),
++        };
++        let mut model = Self {
++            config,
++            reprogram_plans,
++            state: State {
++                identity,
++                units: std::array::from_fn(|_| Unit::empty()),
++                generation: 0,
++            },
++        };
++        if model.config.unit0_preinitialized {
++            model.state.units[0] = model.expected_unit(0, Stage::Complete)?;
++        }
++        Ok(model)
++    }
++
++    fn address(address: u64, size: u8) -> Result<(usize, bool, u32), String> {
++        if size != 4 || address & 3 != 0 {
++            return Err("Banked calibration requires aligned words".into());
++        }
++        let (paired, base) = if (0xff500000..0xff540000).contains(&address) {
++            (true, 0xff500000)
++        } else if (0xff600000..0xff640000).contains(&address) {
++            (false, 0xff600000)
++        } else {
++            return Err("Unknown banked calibration window".into());
++        };
++        Ok((
++            ((address - base) / 0x10000) as usize,
++            paired,
++            ((address - base) % 0x10000) as u32,
++        ))
++    }
++
++    fn reprogram_action(n: usize) -> Option<Action> {
++        match n {
++            722 => Some(Action::ReprogramClear),
++            727 => Some(Action::ReprogramReady),
++            729 => Some(Action::ReprogramPll),
++            _ => None,
++        }
++    }
++
++    fn reprogram_busy(u: &mut Unit, action: Action) {
++        match action {
++            Action::ReprogramClear => {
++                *u.paired.entry(0x7044).or_insert(0) |= 1;
++            }
++            Action::ReprogramReady => {
++                *u.paired.entry(0x7090).or_insert(0) &= !0xff;
++            }
++            _ => {}
++        }
++    }
++
++    fn reprogram_done(u: &mut Unit, action: Action) -> Stage {
++        match action {
++            Action::ReprogramClear => {
++                *u.paired.entry(0x7044).or_insert(0) &= !1;
++                Stage::Reprogram(723)
++            }
++            Action::ReprogramReady => {
++                let status = u.paired.entry(0x7090).or_insert(0);
++                *status = (*status & !0xff) | 1;
++                Stage::Reprogram(728)
++            }
++            Action::ReprogramPll => {
++                for (o, mask) in [(0x4670, 0x30000), (0x4674, 0x30003), (0x4678, 0x30003)] {
++                    *u.primary.get_mut(&o).unwrap() |= mask;
++                }
++                Stage::ReprogramDone
++            }
++            _ => unreachable!(),
++        }
++    }
++
++    fn post_action(n: usize) -> Option<Action> {
++        [
++            Action::PostPll,
++            Action::PostClear,
++            Action::PostController,
++            Action::PostFinalize,
++        ]
++        .get(n)
++        .copied()
++    }
++
++    fn post_busy(u: &mut Unit, action: Action) {
++        if action == Action::PostFinalize {
++            *u.paired.entry(0x7364).or_insert(0) &= !1;
++        }
++    }
++
++    // Explicit fixture effects; the guest's polling order does not prove their physical cause.
++    fn post_done(u: &mut Unit, action: Action) -> Stage {
++        let n = match action {
++            Action::PostPll => {
++                let status = u.paired.get_mut(&0x7c18).unwrap();
++                *status = (*status & !0x40000001) | 1;
++                1
++            }
++            Action::PostClear => {
++                *u.paired.get_mut(&0x7090).unwrap() &= !1;
++                2
++            }
++            Action::PostController => {
++                *u.primary.get_mut(&0x2110).unwrap() |= 1;
++                for o in [0x40dc, 0x42dc] {
++                    let word = u.primary.get_mut(&o).unwrap();
++                    *word = (*word & !0x1300) | 0x300;
++                }
++                3
++            }
++            Action::PostFinalize => {
++                *u.paired.get_mut(&0x7364).unwrap() |= 1;
++                4
++            }
++            _ => unreachable!(),
++        };
++        Stage::PostControl(n)
++    }
++
++    fn write_word(
++        &mut self,
++        cx: &mut Cx<'_>,
++        unit: usize,
++        paired: bool,
++        offset: u32,
++        value: u32,
++    ) -> Result<(), String> {
++        let u = &self.state.units[unit];
++        if let Some(p) = &u.pending {
++            return if p.action.command() == (paired, offset, value) {
++                Ok(())
++            } else {
++                Err("Different banked calibration request while busy".into())
++            };
++        }
++        let (expected, next, action) = match u.stage {
++            Stage::Initial(n) => (
++                (
++                    false,
++                    self.config.initial_script[n].0,
++                    self.config.initial_script[n].1,
++                ),
++                if n + 1 == 686 {
++                    Stage::Kick
++                } else {
++                    Stage::Initial(n + 1)
++                },
++                None,
++            ),
++            Stage::Preparation(n) => (
++                (
++                    true,
++                    self.config.preparation[n].0,
++                    self.config.preparation[n].1,
++                ),
++                if n + 1 == 7 {
++                    Stage::Profile(0)
++                } else {
++                    Stage::Preparation(n + 1)
++                },
++                None,
++            ),
++            Stage::Profile(n) => (
++                (true, self.config.profile[n].0, self.config.profile[n].1),
++                if n + 1 == 17 {
++                    Stage::Command3
++                } else {
++                    Stage::Profile(n + 1)
++                },
++                None,
++            ),
++            Stage::Kick => (
++                Action::Pll.command(),
++                Stage::Pending(Action::Pll),
++                Some(Action::Pll),
++            ),
++            Stage::Command3 => (
++                Action::Clear3.command(),
++                Stage::Pending(Action::Clear3),
++                Some(Action::Clear3),
++            ),
++            Stage::Command10 => (
++                Action::Clear10.command(),
++                Stage::Pending(Action::Clear10),
++                Some(Action::Clear10),
++            ),
++            Stage::Controller => (
++                Action::Controller.command(),
++                Stage::Pending(Action::Controller),
++                Some(Action::Controller),
++            ),
++            Stage::Quality => (
++                Action::Finalize.command(),
++                Stage::Pending(Action::Finalize),
++                Some(Action::Finalize),
++            ),
++            Stage::Acknowledge => ((true, 0x7364, 1), Stage::FinalWrites(0), None),
++            Stage::FinalWrites(n) => (
++                (true, FINAL[n].0, FINAL[n].1),
++                if n + 1 == FINAL.len() {
++                    Stage::Complete
++                } else {
++                    Stage::FinalWrites(n + 1)
++                },
++                None,
++            ),
++            Stage::Complete | Stage::Mode5(_) => {
++                let n = if let Stage::Mode5(n) = u.stage { n } else { 0 };
++                let &(address, value) = self.config.mode5_scripts[unit]
++                    .get(n)
++                    .ok_or("Invalid mode5 prefix")?;
++                let action = (n == 70).then_some(Action::Mode5);
++                (
++                    (true, address & 0xffff, value),
++                    if n == 70 {
++                        Stage::Pending(Action::Mode5)
++                    } else {
++                        Stage::Mode5(n + 1)
++                    },
++                    action,
++                )
++            }
++            Stage::Mode5Done
++                if self.config.mode2.as_ref().is_some_and(|mode2| {
++                    let (a, v) = mode2.scripts[unit][0];
++                    (true, a & 0xffff, v) == (paired, offset, value)
++                }) =>
++            {
++                ((true, offset, value), Stage::Mode2(1), None)
++            }
++            Stage::Mode2(n) => {
++                if !(1..71).contains(&n) {
++                    return Err("Invalid mode2 prefix".into());
++                }
++                let mode2 = self
++                    .config
++                    .mode2
++                    .as_ref()
++                    .ok_or("Mode2 is not configured")?;
++                let (a, v) = mode2.scripts[unit][n];
++                (
++                    (true, a & 0xffff, v),
++                    if n == 70 {
++                        Stage::Pending(Action::Mode2)
++                    } else {
++                        Stage::Mode2(n + 1)
++                    },
++                    (n == 70).then_some(Action::Mode2),
++                )
++            }
++            Stage::Mode5Done | Stage::Removal(_) => {
++                let n = if let Stage::Removal(n) = u.stage {
++                    n
++                } else {
++                    0
++                };
++                if n == 3 {
++                    (
++                        Action::Removal.command(),
++                        Stage::Pending(Action::Removal),
++                        Some(Action::Removal),
++                    )
++                } else {
++                    let &(o, v) = self
++                        .config
++                        .removal_script
++                        .get(n)
++                        .ok_or("Invalid removal prefix")?;
++                    ((true, o, v), Stage::Removal(n + 1), None)
++                }
++            }
++            Stage::Removed | Stage::Reprogram(_) if self.reprogram_plans[unit].is_some() => {
++                let n = if let Stage::Reprogram(n) = u.stage {
++                    n
++                } else {
++                    0
++                };
++                let expected = *self.reprogram_plans[unit]
++                    .as_ref()
++                    .and_then(|p| p.get(n))
++                    .ok_or("Reprogram unit/prefix is not configured")?;
++                let action = Self::reprogram_action(n);
++                (
++                    expected,
++                    action.map_or(Stage::Reprogram(n + 1), Stage::Pending),
++                    action,
++                )
++            }
++            Stage::ReprogramDone | Stage::PostControl(_)
++                if self.config.post_control_source_sha256.is_some() =>
++            {
++                let n = if let Stage::PostControl(n) = u.stage {
++                    n
++                } else {
++                    0
++                };
++                let (o, v) = *POST_CONTROL.get(n).ok_or("Invalid post-control prefix")?;
++                let action = Self::post_action(n);
++                (
++                    (true, o, v),
++                    action.map_or(
++                        if n == 7 {
++                            Stage::PostControlDone
++                        } else {
++                            Stage::PostControl(n + 1)
++                        },
++                        Stage::Pending,
++                    ),
++                    action,
++                )
++            }
++            Stage::PostControlDone | Stage::PostMode2(_)
++                if self.config.post_mode2_source_sha256.is_some() =>
++            {
++                let n = if let Stage::PostMode2(n) = u.stage {
++                    n
++                } else {
++                    0
++                };
++                let mode2 = self
++                    .config
++                    .mode2
++                    .as_ref()
++                    .ok_or("Post-mode2 is not configured")?;
++                let (a, v) = *mode2.scripts[unit]
++                    .get(n)
++                    .ok_or("Invalid post-mode2 prefix")?;
++                (
++                    (true, a & 0xffff, v),
++                    if n == 70 {
++                        Stage::Pending(Action::PostMode2)
++                    } else {
++                        Stage::PostMode2(n + 1)
++                    },
++                    (n == 70).then_some(Action::PostMode2),
++                )
++            }
++            Stage::Mode2Done | Stage::PostMode2Done | Stage::Selector1(_, _)
++                if self.config.selector1_source_sha256.is_some() =>
++            {
++                let (n, from_post) = match u.stage {
++                    Stage::Selector1(n, origin) => (n, origin),
++                    Stage::PostMode2Done => (0, true),
++                    _ => (0, false),
++                };
++                let (o, v) = *SELECTOR1.get(n).ok_or("Invalid selector1 prefix")?;
++                (
++                    (true, o, v),
++                    if n == 2 {
++                        Stage::Pending(Action::Selector1(from_post))
++                    } else {
++                        Stage::Selector1(n + 1, from_post)
++                    },
++                    (n == 2).then_some(Action::Selector1(from_post)),
++                )
++            }
++            _ => return Err("Banked calibration reentry/reset/mode is not modeled".into()),
++        };
++        if expected != (paired, offset, value) {
++            return Err(format!(
++                "Unexpected banked calibration write unit{unit} paired{paired} {offset:#x}={value:#x}"
++            ));
++        }
++        let pending = if let Some(action) = action {
++            Some(Pending {
++                action,
++                started: cx.now(),
++                due: cx
++                    .now()
++                    .checked_add(self.config.latency_ticks)
++                    .ok_or("Calibration deadline overflow")?,
++                token: self
++                    .state
++                    .generation
++                    .checked_add(1)
++                    .ok_or("Calibration generation overflow")?,
++            })
++        } else {
++            None
++        };
++        let u = &mut self.state.units[unit];
++        if paired {
++            u.paired.insert(offset, value);
++        } else {
++            u.primary.insert(offset, value);
++        }
++        if matches!(u.stage, Stage::Acknowledge | Stage::PostControl(4)) {
++            // No W1C law is implied by the observed final write.
++            u.paired.remove(&0x7364);
++            cx.record(Record::new(
++                "XP4 calibration fixture final write recorded",
++                [
++                    ("unit", Field::int(unit as u64)),
++                    ("tick", Field::int(cx.now())),
++                ],
++            ));
++        }
++        if let Some(p) = &pending {
++            match p.action {
++                Action::Clear3 => {
++                    u.paired.insert(0x7044, 1);
++                }
++                Action::Clear10 => {
++                    u.paired.insert(0x7044, 0x10);
++                }
++                Action::Finalize => {
++                    u.paired.insert(0x7364, 0);
++                }
++                Action::Removal => {
++                    *u.paired.entry(0x7090).or_insert(0) &= !1;
++                }
++                _ => {}
++            }
++            Self::reprogram_busy(u, p.action);
++            Self::post_busy(u, p.action);
++            self.state.generation = p.token;
++            cx.schedule(p.due, p.token);
++        }
++        u.pending = pending;
++        u.stage = next;
++        Ok(())
++    }
++
++    // Build the sole allowed register state at each prefix, also validating checkpoints.
++    fn expected_unit(&self, unit: usize, target: Stage) -> Result<Unit, String> {
++        if matches!(
++            target,
++            Stage::Selector1(_, _) | Stage::Pending(Action::Selector1(_)) | Stage::Selector1Done(_)
++        ) {
++            if self.config.selector1_source_sha256.is_none() {
++                return Err("Selector1 is not configured".into());
++            }
++            let (count, from_post) = match target {
++                Stage::Selector1(n, origin) if (1..3).contains(&n) => (n, origin),
++                Stage::Pending(Action::Selector1(origin)) | Stage::Selector1Done(origin) => {
++                    (3, origin)
++                }
++                _ => return Err("Invalid selector1 prefix".into()),
++            };
++            let mut u = self.expected_unit(
++                unit,
++                if from_post {
++                    Stage::PostMode2Done
++                } else {
++                    Stage::Mode2Done
++                },
++            )?;
++            u.paired.extend(SELECTOR1[..count].iter().copied());
++            if matches!(target, Stage::Selector1Done(_)) {
++                u.paired.insert(0x5384, 0);
++            }
++            u.stage = target;
++            return Ok(u);
++        }
++        if matches!(
++            target,
++            Stage::PostMode2(_) | Stage::Pending(Action::PostMode2) | Stage::PostMode2Done
++        ) {
++            if self.config.post_mode2_source_sha256.is_none() {
++                return Err("Post-mode2 is not configured".into());
++            }
++            let count = match target {
++                Stage::PostMode2(n) if (1..71).contains(&n) => n,
++                Stage::Pending(Action::PostMode2) | Stage::PostMode2Done => 71,
++                _ => return Err("Invalid post-mode2 prefix".into()),
++            };
++            let mut u = self.expected_unit(unit, Stage::PostControlDone)?;
++            let mode2 = self
++                .config
++                .mode2
++                .as_ref()
++                .ok_or("Post-mode2 is not configured")?;
++            u.paired.extend(
++                mode2.scripts[unit][..count]
++                    .iter()
++                    .map(|(a, v)| (a & 0xffff, *v)),
++            );
++            if target == Stage::PostMode2Done {
++                u.paired.insert(0x5384, 0);
++            }
++            u.stage = target;
++            return Ok(u);
++        }
++        if matches!(
++            target,
++            Stage::PostControl(_)
++                | Stage::PostControlDone
++                | Stage::Pending(
++                    Action::PostPll
++                        | Action::PostClear
++                        | Action::PostController
++                        | Action::PostFinalize
++                )
++        ) {
++            if self.config.post_control_source_sha256.is_none() {
++                return Err("Post-control is not configured".into());
++            }
++            let count = match target {
++                Stage::PostControl(n) if (1..8).contains(&n) => n,
++                Stage::PostControlDone => 8,
++                Stage::Pending(Action::PostPll) => 1,
++                Stage::Pending(Action::PostClear) => 2,
++                Stage::Pending(Action::PostController) => 3,
++                Stage::Pending(Action::PostFinalize) => 4,
++                _ => return Err("Invalid post-control prefix".into()),
++            };
++            let mut u = self.expected_unit(unit, Stage::ReprogramDone)?;
++            for (n, &(o, v)) in POST_CONTROL[..count].iter().enumerate() {
++                u.paired.insert(o, v);
++                if n == 4 {
++                    u.paired.remove(&0x7364);
++                }
++                if let Some(action) = Self::post_action(n) {
++                    Self::post_busy(&mut u, action);
++                    if target != Stage::Pending(action) {
++                        Self::post_done(&mut u, action);
++                    }
++                }
++            }
++            u.stage = target;
++            return Ok(u);
++        }
++        if matches!(
++            target,
++            Stage::Reprogram(_)
++                | Stage::ReprogramDone
++                | Stage::Pending(
++                    Action::ReprogramClear | Action::ReprogramReady | Action::ReprogramPll
++                )
++        ) {
++            let plan = self.reprogram_plans[unit]
++                .as_ref()
++                .ok_or("Reprogram unit is not configured")?;
++            let count = match target {
++                Stage::Reprogram(n) if (1..730).contains(&n) => n,
++                Stage::Pending(Action::ReprogramClear) => 723,
++                Stage::Pending(Action::ReprogramReady) => 728,
++                Stage::Pending(Action::ReprogramPll) | Stage::ReprogramDone => 730,
++                _ => return Err("Invalid reprogram prefix".into()),
++            };
++            let mut u = self.expected_unit(unit, Stage::Removed)?;
++            for (n, &(paired, off, value)) in plan[..count].iter().enumerate() {
++                if paired {
++                    u.paired.insert(off, value);
++                } else {
++                    u.primary.insert(off, value);
++                }
++                if let Some(action) = Self::reprogram_action(n) {
++                    Self::reprogram_busy(&mut u, action);
++                    if target != Stage::Pending(action) {
++                        Self::reprogram_done(&mut u, action);
++                    }
++                }
++            }
++            u.stage = target;
++            return Ok(u);
++        }
++        let mut u = Unit::empty();
++        let initial = if let Stage::Initial(n) = target {
++            if n >= 686 {
++                return Err("Invalid initial prefix".into());
++            }
++            n
++        } else {
++            686
++        };
++        u.primary
++            .extend(self.config.initial_script[..initial].iter().copied());
++        if matches!(target, Stage::Initial(_)) {
++            u.stage = target;
++            return Ok(u);
++        }
++        u.stage = Stage::Kick;
++        if target == u.stage {
++            return Ok(u);
++        }
++        u.paired.insert(0x7c18, 0x40000000);
++        u.stage = Stage::Pending(Action::Pll);
++        if target == u.stage {
++            return Ok(u);
++        }
++        u.pll_done();
++        let n = if let Stage::Preparation(n) = target {
++            if n >= 7 {
++                return Err("Invalid preparation prefix".into());
++            }
++            n
++        } else {
++            7
++        };
++        u.paired
++            .extend(self.config.preparation[..n].iter().copied());
++        if matches!(target, Stage::Preparation(_)) {
++            u.stage = target;
++            return Ok(u);
++        }
++        let n = if let Stage::Profile(n) = target {
++            if n >= 17 {
++                return Err("Invalid profile prefix".into());
++            }
++            n
++        } else {
++            17
++        };
++        u.paired.extend(self.config.profile[..n].iter().copied());
++        if matches!(target, Stage::Profile(_)) {
++            u.stage = target;
++            return Ok(u);
++        }
++        for (before, action, after) in [
++            (Stage::Command3, Action::Clear3, Stage::Command10),
++            (Stage::Command10, Action::Clear10, Stage::Controller),
++            (Stage::Controller, Action::Controller, Stage::Quality),
++            (Stage::Quality, Action::Finalize, Stage::Acknowledge),
++        ] {
++            u.stage = before;
++            if target == u.stage {
++                return Ok(u);
++            }
++            let (paired, off, value) = action.command();
++            if paired {
++                u.paired.insert(off, value);
++            } else {
++                u.primary.insert(off, value);
++            }
++            match action {
++                Action::Clear3 => {
++                    u.paired.insert(0x7044, 1);
++                }
++                Action::Clear10 => {
++                    u.paired.insert(0x7044, 0x10);
++                }
++                Action::Finalize => {
++                    u.paired.insert(0x7364, 0);
++                }
++                _ => {}
++            }
++            u.stage = Stage::Pending(action);
++            if target == u.stage {
++                return Ok(u);
++            }
++            match action {
++                Action::Clear3 | Action::Clear10 => {
++                    u.paired.insert(0x7044, 0);
++                }
++                Action::Controller => u.controller_done(self.config.results[unit]),
++                Action::Finalize => {
++                    u.paired.insert(0x7364, 1);
++                }
++                _ => {}
++            }
++            u.stage = after;
++        }
++        if target == Stage::Acknowledge {
++            return Ok(u);
++        }
++        u.paired.remove(&0x7364);
++        let n = if let Stage::FinalWrites(n) = target {
++            if n >= FINAL.len() {
++                return Err("Invalid final prefix".into());
++            }
++            n
++        } else if matches!(
++            target,
++            Stage::Complete
++                | Stage::Mode5(_)
++                | Stage::Pending(Action::Mode5)
++                | Stage::Mode5Done
++                | Stage::Mode2(_)
++                | Stage::Pending(Action::Mode2)
++                | Stage::Mode2Done
++                | Stage::Removal(_)
++                | Stage::Pending(Action::Removal)
++                | Stage::Removed
++        ) {
++            FINAL.len()
++        } else {
++            return Err("Invalid calibration phase".into());
++        };
++        u.paired.extend(FINAL[..n].iter().copied());
++        let n = match target {
++            Stage::Mode5(n) if (1..71).contains(&n) => n,
++            Stage::Mode5(_) => return Err("Invalid mode5 prefix".into()),
++            Stage::Pending(Action::Mode5)
++            | Stage::Mode5Done
++            | Stage::Mode2(_)
++            | Stage::Pending(Action::Mode2)
++            | Stage::Mode2Done
++            | Stage::Removal(_)
++            | Stage::Pending(Action::Removal)
++            | Stage::Removed => 71,
++            _ => 0,
++        };
++        u.paired.extend(
++            self.config.mode5_scripts[unit][..n]
++                .iter()
++                .map(|(a, v)| (a & 0xffff, *v)),
++        );
++        if matches!(
++            target,
++            Stage::Mode5Done
++                | Stage::Mode2(_)
++                | Stage::Pending(Action::Mode2)
++                | Stage::Mode2Done
++                | Stage::Removal(_)
++                | Stage::Pending(Action::Removal)
++                | Stage::Removed
++        ) {
++            u.paired.insert(0x5384, 0);
++            // Explicit virtual status convention, not a recovered physical reset value.
++            *u.paired.entry(0x7090).or_insert(0) &= !1;
++        }
++        let n = match target {
++            Stage::Mode2(n) if (1..71).contains(&n) => n,
++            Stage::Mode2(_) => return Err("Invalid mode2 prefix".into()),
++            Stage::Pending(Action::Mode2) | Stage::Mode2Done => 71,
++            _ => 0,
++        };
++        if n != 0 {
++            let mode2 = self
++                .config
++                .mode2
++                .as_ref()
++                .ok_or("Mode2 is not configured")?;
++            u.paired.extend(
++                mode2.scripts[unit][..n]
++                    .iter()
++                    .map(|(a, v)| (a & 0xffff, *v)),
++            );
++            if target == Stage::Mode2Done {
++                u.paired.insert(0x5384, 0);
++            }
++            u.stage = target;
++            return Ok(u);
++        }
++        let n = match target {
++            Stage::Removal(n) if (1..=3).contains(&n) => n,
++            Stage::Removal(_) => return Err("Invalid removal prefix".into()),
++            Stage::Pending(Action::Removal) | Stage::Removed => 3,
++            _ => 0,
++        };
++        u.paired
++            .extend(self.config.removal_script[..n].iter().copied());
++        if matches!(target, Stage::Pending(Action::Removal) | Stage::Removed) {
++            u.paired.insert(0x7080, 0x100);
++        }
++        if target == Stage::Removed {
++            *u.paired.entry(0x7090).or_insert(0) |= 1;
++        }
++        u.stage = target;
++        Ok(u)
++    }
++
++    fn validate_state(&self, state: &State) -> Result<(), String> {
++        if state.identity != self.state.identity {
++            return Err("Calibration checkpoint configuration differs".into());
++        }
++        let mut tokens = BTreeSet::new();
++        let mut issued = 0;
++        for (i, u) in state.units.iter().enumerate() {
++            if i == 0
++                && self.config.unit0_preinitialized
++                && !matches!(
++                    u.stage,
++                    Stage::Complete
++                        | Stage::Mode5(_)
++                        | Stage::Pending(Action::Mode5)
++                        | Stage::Mode5Done
++                        | Stage::Mode2(_)
++                        | Stage::Pending(Action::Mode2)
++                        | Stage::Mode2Done
++                        | Stage::Removal(_)
++                        | Stage::Pending(Action::Removal)
++                        | Stage::Removed
++                        | Stage::Reprogram(_)
++                        | Stage::ReprogramDone
++                        | Stage::PostControl(_)
++                        | Stage::PostControlDone
++                        | Stage::PostMode2(_)
++                        | Stage::PostMode2Done
++                        | Stage::Selector1(_, _)
++                        | Stage::Selector1Done(_)
++                        | Stage::Pending(Action::Selector1(_))
++                        | Stage::Pending(Action::PostMode2)
++                        | Stage::Pending(
++                            Action::PostPll
++                                | Action::PostClear
++                                | Action::PostController
++                                | Action::PostFinalize
++                        )
++                        | Stage::Pending(
++                            Action::ReprogramClear | Action::ReprogramReady | Action::ReprogramPll
++                        )
++                )
++            {
++                return Err("Preinitialized unit0 checkpoint differs".into());
++            }
++            let expected = self.expected_unit(i, u.stage)?;
++            if expected.primary != u.primary || expected.paired != u.paired {
++                return Err("Calibration checkpoint registers differ from phase".into());
++            }
++            match (u.stage, &u.pending) {
++                (Stage::Pending(a), Some(p))
++                    if p.action == a
++                        && p.token != 0
++                        && p.token <= state.generation
++                        && tokens.insert(p.token)
++                        && p.started.checked_add(self.config.latency_ticks) == Some(p.due) => {}
++                (Stage::Pending(_), _) | (_, Some(_)) => {
++                    return Err("Invalid calibration pending event".into());
++                }
++                _ => {}
++            }
++            let selector_issued = match u.stage {
++                Stage::Selector1(_, origin) => Some((origin, 0)),
++                Stage::Pending(Action::Selector1(origin)) | Stage::Selector1Done(origin) => {
++                    Some((origin, 1))
++                }
++                _ => None,
++            };
++            if let Some((origin, count)) = selector_issued {
++                let base = match (origin, i == 0 && self.config.unit0_preinitialized) {
++                    (false, false) => 7,
++                    (false, true) => 2,
++                    (true, false) => 15,
++                    (true, true) => 10,
++                };
++                let unit_issued = base + count;
++                if u.pending.as_ref().is_some_and(|p| p.token < unit_issued) {
++                    return Err("Calibration pending token predates unit commands".into());
++                }
++                issued += unit_issued;
++                continue;
++            }
++            let post_mode2_issued = match u.stage {
++                Stage::PostMode2(_) => Some(0),
++                Stage::Pending(Action::PostMode2) | Stage::PostMode2Done => Some(1),
++                _ => None,
++            };
++            if let Some(count) = post_mode2_issued {
++                let unit_issued = if i == 0 && self.config.unit0_preinitialized {
++                    9
++                } else {
++                    14
++                } + count;
++                if u.pending.as_ref().is_some_and(|p| p.token < unit_issued) {
++                    return Err("Calibration pending token predates unit commands".into());
++                }
++                issued += unit_issued;
++                continue;
++            }
++            let post_issued = match u.stage {
++                Stage::PostControl(n) => Some(n.min(4) as u64),
++                Stage::PostControlDone => Some(4),
++                Stage::Pending(Action::PostPll) => Some(1),
++                Stage::Pending(Action::PostClear) => Some(2),
++                Stage::Pending(Action::PostController) => Some(3),
++                Stage::Pending(Action::PostFinalize) => Some(4),
++                _ => None,
++            };
++            if let Some(count) = post_issued {
++                let unit_issued = if i == 0 && self.config.unit0_preinitialized {
++                    5
++                } else {
++                    10
++                } + count;
++                if u.pending.as_ref().is_some_and(|p| p.token < unit_issued) {
++                    return Err("Calibration pending token predates unit commands".into());
++                }
++                issued += unit_issued;
++                continue;
++            }
++            let reprogram_issued = match u.stage {
++                Stage::Reprogram(n) => Some(u64::from(n > 722) + u64::from(n > 727)),
++                Stage::Pending(Action::ReprogramClear) => Some(1),
++                Stage::Pending(Action::ReprogramReady) => Some(2),
++                Stage::Pending(Action::ReprogramPll) | Stage::ReprogramDone => Some(3),
++                _ => None,
++            };
++            if let Some(count) = reprogram_issued {
++                let unit_issued = if i == 0 && self.config.unit0_preinitialized {
++                    2
++                } else {
++                    7
++                } + count;
++                if u.pending.as_ref().is_some_and(|p| p.token < unit_issued) {
++                    return Err("Calibration pending token predates unit commands".into());
++                }
++                issued += unit_issued;
++                continue;
++            }
++            let cold_issued = if i == 0 && self.config.unit0_preinitialized {
++                0
++            } else {
++                match u.stage {
++                    Stage::Initial(_) | Stage::Kick => 0,
++                    Stage::Pending(Action::Pll)
++                    | Stage::Preparation(_)
++                    | Stage::Profile(_)
++                    | Stage::Command3 => 1,
++                    Stage::Pending(Action::Clear3) | Stage::Command10 => 2,
++                    Stage::Pending(Action::Clear10) | Stage::Controller => 3,
++                    Stage::Pending(Action::Controller) | Stage::Quality => 4,
++                    _ => 5,
++                }
++            };
++            let unit_issued = cold_issued
++                + u64::from(matches!(
++                    u.stage,
++                    Stage::Pending(Action::Mode5)
++                        | Stage::Mode5Done
++                        | Stage::Mode2(_)
++                        | Stage::Pending(Action::Mode2)
++                        | Stage::Mode2Done
++                        | Stage::Removal(_)
++                        | Stage::Pending(Action::Removal)
++                        | Stage::Removed
++                ))
++                + u64::from(matches!(
++                    u.stage,
++                    Stage::Pending(Action::Mode2) | Stage::Mode2Done
++                ))
++                + u64::from(matches!(
++                    u.stage,
++                    Stage::Pending(Action::Removal) | Stage::Removed
++                ));
++            if u.pending.as_ref().is_some_and(|p| p.token < unit_issued) {
++                return Err("Calibration pending token predates unit commands".into());
++            }
++            issued += unit_issued;
++        }
++        if state.generation != issued {
++            return Err("Calibration checkpoint generation differs from phases".into());
++        }
++        Ok(())
++    }
++}
++
++impl Device for BankedCalibration {
++    fn name(&self) -> &'static str {
++        NAME
++    }
++    fn read(&mut self, cx: &mut Cx<'_>, address: u64, size: u8) -> u64 {
++        let result = Self::address(address, size).and_then(|(i, paired, off)| {
++            let u = &self.state.units[i];
++            (if paired { &u.paired } else { &u.primary })
++                .get(&off)
++                .copied()
++                .ok_or_else(|| {
++                    format!("Unknown calibration read unit{i} paired{paired} offset{off:#x}")
++                })
++        });
++        match result {
++            Ok(v) => v.into(),
++            Err(e) => {
++                cx.fail(e);
++                0
++            }
++        }
++    }
++    fn write(&mut self, cx: &mut Cx<'_>, address: u64, size: u8, value: u64) {
++        let result = Self::address(address, size).and_then(|(i, paired, off)| {
++            let value =
++                u32::try_from(value).map_err(|_| "Calibration word exceeds32 bits".to_string())?;
++            self.write_word(cx, i, paired, off, value)
++        });
++        if let Err(e) = result {
++            cx.fail(e);
++        }
++    }
++    fn event(&mut self, cx: &mut Cx<'_>, token: u64) {
++        for (i, u) in self.state.units.iter_mut().enumerate() {
++            let Some(p) = u
++                .pending
++                .as_ref()
++                .filter(|p| p.token == token && p.due <= cx.now())
++                .cloned()
++            else {
++                continue;
++            };
++            match p.action {
++                Action::Pll => {
++                    u.pll_done();
++                    u.stage = Stage::Preparation(0);
++                }
++                Action::Clear3 => {
++                    u.paired.insert(0x7044, 0);
++                    u.stage = Stage::Command10;
++                }
++                Action::Clear10 => {
++                    u.paired.insert(0x7044, 0);
++                    u.stage = Stage::Controller;
++                }
++                Action::Controller => {
++                    u.controller_done(self.config.results[i]);
++                    u.stage = Stage::Quality;
++                }
++                Action::Finalize => {
++                    u.paired.insert(0x7364, 1);
++                    u.stage = Stage::Acknowledge;
++                }
++                Action::Mode5 => {
++                    // Synthetic full-word completion after declared latency; physical timing is unproven.
++                    u.paired.insert(0x5384, 0);
++                    *u.paired.entry(0x7090).or_insert(0) &= !1;
++                    u.stage = Stage::Mode5Done;
++                }
++                Action::Selector1(from_post) => {
++                    u.paired.insert(0x5384, 0);
++                    u.stage = Stage::Selector1Done(from_post);
++                }
++                Action::PostMode2 => {
++                    u.paired.insert(0x5384, 0);
++                    u.stage = Stage::PostMode2Done;
++                }
++                Action::Mode2 => {
++                    // Explicit virtual full-word completion; no other register law is implied.
++                    u.paired.insert(0x5384, 0);
++                    u.stage = Stage::Mode2Done;
++                }
++                Action::PostPll
++                | Action::PostClear
++                | Action::PostController
++                | Action::PostFinalize => {
++                    u.stage = Self::post_done(u, p.action);
++                }
++                Action::ReprogramClear | Action::ReprogramReady | Action::ReprogramPll => {
++                    u.stage = Self::reprogram_done(u, p.action);
++                }
++                Action::Removal => {
++                    // Synthetic masked completion after declared latency; physical law is unproven.
++                    *u.paired.entry(0x7090).or_insert(0) |= 1;
++                    u.stage = Stage::Removed;
++                }
++            }
++            u.pending = None;
++            cx.record(Record::new(
++                "XP4 banked calibration fixture completed",
++                [
++                    ("unit", Field::int(i as u64)),
++                    ("phase", Field::constant(p.action.label())),
++                    ("tick", Field::int(p.due)),
++                ],
++            ));
++        }
++    }
++    fn advance(&mut self, cx: &mut Cx<'_>) {
++        let mut due: Vec<_> = self
++            .state
++            .units
++            .iter()
++            .filter_map(|u| u.pending.as_ref())
++            .filter(|p| p.due <= cx.now())
++            .map(|p| (p.due, p.token))
++            .collect();
++        due.sort_unstable();
++        for (_, token) in due {
++            self.event(cx, token);
++        }
++    }
++    fn next_deadline(&self, _: u64) -> Option<u64> {
++        self.state
++            .units
++            .iter()
++            .filter_map(|u| u.pending.as_ref().map(|p| p.due))
++            .min()
++    }
++    fn pollable(&self, address: u64, size: u8) -> bool {
++        Self::address(address, size).is_ok_and(|(i, paired, off)| {
++            let u = &self.state.units[i];
++            (if paired { &u.paired } else { &u.primary }).contains_key(&off)
++        })
++    }
++    fn save(&self) -> serde_json::Value {
++        serde_json::to_value(&self.state).unwrap()
++    }
++    fn checkpoint(&self) -> Result<Checkpoint, String> {
++        Checkpoint::encode(NAME, &self.state)
++    }
++    fn validate_checkpoint(&self, saved: &Checkpoint) -> Result<(), String> {
++        if !saved.blobs().is_empty() || !saved.children().is_empty() {
++            return Err("Unexpected calibration checkpoint attachments".into());
++        }
++        self.validate_state(&saved.decode(NAME)?)
++    }
++    fn restore_checkpoint(&mut self, saved: &Checkpoint) -> Result<(), String> {
++        self.validate_checkpoint(saved)?;
++        self.state = saved.decode(NAME)?;
++        Ok(())
++    }
++    fn fingerprint(&self) -> Result<serde_json::Value, String> {
++        Ok(self.save())
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use fujimod_emulator_devices::test_host::{TestHost, advance, read, write};
++    fn source_hash(c: &Config) -> String {
++        let bytes: Vec<u8> = c
++            .initial_script
++            .iter()
++            .chain(&c.preparation)
++            .chain(&c.profile)
++            .flat_map(|(o, v)| o.to_le_bytes().into_iter().chain(v.to_le_bytes()))
++            .collect();
++        fujimod_emulator_devices::fingerprint::bytes(&bytes)["sha256"]
++            .as_str()
++            .unwrap()
++            .into()
++    }
++    fn mode5_hash(c: &Config) -> String {
++        let bytes: Vec<u8> = c
++            .mode5_scripts
++            .iter()
++            .flatten()
++            .flat_map(|(a, v)| a.to_le_bytes().into_iter().chain(v.to_le_bytes()))
++            .collect();
++        fujimod_emulator_devices::fingerprint::bytes(&bytes)["sha256"]
++            .as_str()
++            .unwrap()
++            .into()
++    }
++    fn removal_hash(c: &Config) -> String {
++        let bytes: Vec<u8> = c
++            .removal_script
++            .iter()
++            .flat_map(|(o, v)| o.to_le_bytes().into_iter().chain(v.to_le_bytes()))
++            .chain(c.removal_poll.iter().flat_map(|v| v.to_le_bytes()))
++            .collect();
++        fujimod_emulator_devices::fingerprint::bytes(&bytes)["sha256"]
++            .as_str()
++            .unwrap()
++            .into()
++    }
++    fn config() -> Config {
++        let mut words = BTreeMap::from([
++            (0x2000, 0xb00),
++            (0x2110, 0),
++            (0x4670, 0x924),
++            (0x4674, 0),
++            (0x4678, 0),
++            (0x40dc, 0),
++            (0x42dc, 0),
++            (0x444c, 0),
++            (0x4620, 0),
++            (0x4480, 0x30099),
++            (0x4484, 0x03000300),
++            (0x4488, 0x03000300),
++            (0x448c, 0x300),
++            (0x4660, 0x03000000),
++            (0x4664, 0x300),
++        ]);
++        for off in (0..0x10000).step_by(4) {
++            if words.len() == 686 {
++                break;
++            }
++            words.entry(off).or_insert(0);
++        }
++        let mut c = Config {
++            initial_script: words.into_iter().collect(),
++            preparation: vec![
++                (0x7c30, 0x40),
++                (0x7c20, 0x80000520),
++                (0x7200, 0x801),
++                (0x7204, 0x140),
++                (0x7210, 0x40000800),
++                (0x7214, 0x140),
++                (0x7240, 0x24805),
++            ],
++            profile: (0..17).map(|i| (0x7600 + i * 4, i)).collect(),
++            results: [[1, 2, 3, 4], [5, 6, 7, 8], [0; 4], [9, 10, 11, 12]],
++            latency_ticks: 8,
++            source_sha256: String::new(),
++            mode5_scripts: std::array::from_fn(|unit| {
++                let base = 0xff500000 + unit as u32 * 0x10000;
++                (0..23)
++                    .map(|i| (base + 0x5000 + i * 4, 0x01004100))
++                    .chain((0..24).map(|i| {
++                        (
++                            base + 0x5200 + i * 4,
++                            if i == 23 { 0 } else { unit as u32 + 1 },
++                        )
++                    }))
++                    .chain((0..23).map(|i| (base + 0x5400 + i * 4, 0x81)))
++                    .chain([(base + 0x5384, 1)])
++                    .collect()
++            }),
++            mode5_sha256: String::new(),
++            removal_script: vec![(0x7114, 0), (0x7c40, 0x80000000), (0x7c14, 0x80000000)],
++            removal_poll: [0x7080, 0x100, 0x7090, 1, 1],
++            removal_sha256: String::new(),
++            unit0_preinitialized: false,
++            mode2: None,
++            reprogram: None,
++            post_control_source_sha256: None,
++            post_mode2_source_sha256: None,
++            selector1_source_sha256: None,
++        };
++        c.source_sha256 = source_hash(&c);
++        c.mode5_sha256 = mode5_hash(&c);
++        c.removal_sha256 = removal_hash(&c);
++        c
++    }
++    fn p(i: usize, off: u32) -> u64 {
++        0xff600000 + (i as u64) * 0x10000 + u64::from(off)
++    }
++    fn q(i: usize, off: u32) -> u64 {
++        0xff500000 + (i as u64) * 0x10000 + u64::from(off)
++    }
++    fn program(m: &mut BankedCalibration, h: &mut TestHost, i: usize) {
++        for (o, v) in m.config.initial_script.clone() {
++            write(m, h, p(i, o), v);
++        }
++    }
++    fn configured(m: &mut BankedCalibration, h: &mut TestHost, i: usize) {
++        program(m, h, i);
++        write(m, h, q(i, 0x7c18), 0x40000000);
++        let at = h.now + 8;
++        advance(m, h, at);
++        for (o, v) in m
++            .config
++            .preparation
++            .clone()
++            .into_iter()
++            .chain(m.config.profile.clone())
++        {
++            write(m, h, q(i, o), v);
++            m.validate_checkpoint(&m.checkpoint().unwrap()).unwrap();
++        }
++    }
++    fn controller(m: &mut BankedCalibration, h: &mut TestHost, i: usize) {
++        configured(m, h, i);
++        write(m, h, q(i, 0x7040), 3);
++        m.validate_checkpoint(&m.checkpoint().unwrap()).unwrap();
++        let at = h.now + 8;
++        advance(m, h, at);
++        write(m, h, q(i, 0x7040), 0x10);
++        m.validate_checkpoint(&m.checkpoint().unwrap()).unwrap();
++        let at = h.now + 8;
++        advance(m, h, at);
++        write(m, h, p(i, 0x2000), 0xb01);
++        m.validate_checkpoint(&m.checkpoint().unwrap()).unwrap();
++        let at = h.now + 8;
++        advance(m, h, at);
++    }
++    fn refused(m: &mut BankedCalibration, h: &mut TestHost, a: u64, value: u32) {
++        let before = m.save();
++        let mut cx = h.cx();
++        m.write(&mut cx, a, 4, value.into());
++        assert!(cx.refusal().is_some());
++        assert_eq!(m.save(), before);
++    }
++    #[test]
++    fn command_events_are_delayed_repeat_safe_and_generation_isolated() {
++        let mut m = BankedCalibration::new(config()).unwrap();
++        let mut h = TestHost::new();
++        program(&mut m, &mut h, 1);
++        assert_eq!(read(&mut m, &mut h, p(1, 0x4670)), 0x924);
++        write(&mut m, &mut h, q(1, 0x7c18), 0x40000000);
++        let token = m.state.units[1].pending.as_ref().unwrap().token;
++        h.now = 3;
++        write(&mut m, &mut h, q(1, 0x7c18), 0x40000000);
++        assert_eq!(m.next_deadline(3), Some(8));
++        refused(&mut m, &mut h, q(1, 0x7c18), 0);
++        advance(&mut m, &mut h, 7);
++        assert_eq!(read(&mut m, &mut h, p(1, 0x4670)), 0x924);
++        advance(&mut m, &mut h, 8);
++        assert_eq!(read(&mut m, &mut h, p(1, 0x4670)), 0x30924);
++        for (o, v) in m
++            .config
++            .preparation
++            .clone()
++            .into_iter()
++            .chain(m.config.profile.clone())
++        {
++            write(&mut m, &mut h, q(1, o), v);
++        }
++        write(&mut m, &mut h, q(1, 0x7040), 3);
++        assert_eq!(read(&mut m, &mut h, q(1, 0x7044)), 1);
++        m.event(&mut h.cx(), token);
++        assert_eq!(read(&mut m, &mut h, q(1, 0x7044)), 1);
++        advance(&mut m, &mut h, 16);
++        assert_eq!(read(&mut m, &mut h, q(1, 0x7044)), 0);
++        write(&mut m, &mut h, q(1, 0x7040), 0x10);
++        advance(&mut m, &mut h, 24);
++        write(&mut m, &mut h, p(1, 0x2000), 0xb01);
++        assert_eq!(read(&mut m, &mut h, p(1, 0x2110)), 0);
++        assert_eq!(read(&mut m, &mut h, p(1, 0x444c)), 0);
++        advance(&mut m, &mut h, 32);
++        assert_eq!(read(&mut m, &mut h, p(1, 0x2110)), 1);
++        assert_eq!(read(&mut m, &mut h, p(1, 0x444c)), 0x00060005);
++        assert_eq!(read(&mut m, &mut h, p(1, 0x4620)), 0x00080007);
++        for (o, v) in [
++            (0x4480, 0x30099),
++            (0x4484, 0x03000300),
++            (0x4488, 0x03000300),
++            (0x448c, 0x300),
++            (0x4660, 0x03000000),
++            (0x4664, 0x300),
++        ] {
++            assert_eq!(read(&mut m, &mut h, p(1, o)), v);
++        }
++        assert_eq!(read(&mut m, &mut h, p(1, 0x40dc)), 0x300);
++        m.validate_checkpoint(&m.checkpoint().unwrap()).unwrap();
++    }
++    #[test]
++    fn zero_results_remain_visible_and_final_ack_has_no_invented_w1c() {
++        let mut m = BankedCalibration::new(config()).unwrap();
++        let mut h = TestHost::new();
++        controller(&mut m, &mut h, 2);
++        assert_eq!(read(&mut m, &mut h, p(2, 0x444c)), 0);
++        assert_eq!(read(&mut m, &mut h, p(2, 0x4620)), 0);
++        write(&mut m, &mut h, q(2, 0x7360), 0xff00c00d);
++        m.validate_checkpoint(&m.checkpoint().unwrap()).unwrap();
++        assert_eq!(read(&mut m, &mut h, q(2, 0x7364)), 0);
++        advance(&mut m, &mut h, 40);
++        assert_eq!(read(&mut m, &mut h, q(2, 0x7364)), 1);
++        write(&mut m, &mut h, q(2, 0x7364), 1);
++        m.validate_checkpoint(&m.checkpoint().unwrap()).unwrap();
++        let mut cx = h.cx();
++        m.read(&mut cx, q(2, 0x7364), 4);
++        assert!(cx.refusal().is_some());
++        for (o, v) in FINAL {
++            write(&mut m, &mut h, q(2, o), v);
++            m.validate_checkpoint(&m.checkpoint().unwrap()).unwrap();
++        }
++        m.validate_checkpoint(&m.checkpoint().unwrap()).unwrap();
++        refused(&mut m, &mut h, q(2, 0x7c18), 0x40000000);
++        refused(&mut m, &mut h, q(2, 0x5000), 1);
++    }
++    #[test]
++    fn checkpoint_prefix_pending_cancellation_and_configuration_are_checked() {
++        let mut m = BankedCalibration::new(config()).unwrap();
++        let mut h = TestHost::new();
++        for (o, v) in m.config.initial_script[..13].to_vec() {
++            write(&mut m, &mut h, p(1, o), v);
++        }
++        let prefix = m.checkpoint().unwrap();
++        let prefix_state = m.save();
++        let mut fresh = BankedCalibration::new(config()).unwrap();
++        fresh.restore_checkpoint(&prefix).unwrap();
++        assert_eq!(fresh.save(), prefix_state);
++        for (o, v) in m.config.initial_script[13..].to_vec() {
++            write(&mut m, &mut h, p(1, o), v);
++        }
++        let before_command = m.checkpoint().unwrap();
++        write(&mut m, &mut h, q(1, 0x7c18), 0x40000000);
++        let pending = m.checkpoint().unwrap();
++        let token = m.state.units[1].pending.as_ref().unwrap().token;
++        m.restore_checkpoint(&before_command).unwrap();
++        h.now = 8;
++        m.event(&mut h.cx(), token);
++        assert_eq!(read(&mut m, &mut h, p(1, 0x4670)), 0x924);
++        assert_eq!(m.next_deadline(8), None);
++        m.restore_checkpoint(&pending).unwrap();
++        advance(&mut m, &mut h, 8);
++        assert_eq!(read(&mut m, &mut h, p(1, 0x4670)), 0x30924);
++        let mut bad: State = pending.decode(NAME).unwrap();
++        bad.units[1].pending.as_mut().unwrap().due += 1;
++        assert!(
++            m.restore_checkpoint(&Checkpoint::encode(NAME, &bad).unwrap())
++                .is_err()
++        );
++        let mut bad: State = pending.decode(NAME).unwrap();
++        bad.units[1].primary.insert(0x4480, 0);
++        assert!(
++            m.validate_checkpoint(&Checkpoint::encode(NAME, &bad).unwrap())
++                .is_err()
++        );
++        let mut c = config();
++        c.results[0][0] += 1;
++        let other = BankedCalibration::new(c).unwrap();
++        assert!(other.validate_checkpoint(&pending).is_err());
++        let mut c = config();
++        c.initial_script[0].1 = 1;
++        c.source_sha256 = source_hash(&c);
++        let other = BankedCalibration::new(c).unwrap();
++        assert!(other.validate_checkpoint(&pending).is_err());
++        assert!(m.save()["identity"].get("initial_script").is_none());
++    }
++    #[test]
++    fn bounded_inputs_unknown_access_and_preinitialized_unit0_are_explicit() {
++        for change in 0..6 {
++            let mut c = config();
++            match change {
++                0 => c.latency_ticks = 0,
++                1 => c.results[0][0] = 0x800,
++                2 => c.initial_script[1].0 = c.initial_script[0].0,
++                3 => c.initial_script[0].0 = 1,
++                4 => c.preparation.pop().map(|_| ()).unwrap(),
++                _ => c.source_sha256 = "0".repeat(64),
++            };
++            assert!(BankedCalibration::new(c).is_err());
++        }
++        let mut c = config();
++        c.unit0_preinitialized = true;
++        let mut m = BankedCalibration::new(c).unwrap();
++        let mut h = TestHost::new();
++        assert_eq!(read(&mut m, &mut h, p(0, 0x4480)), 0x30099);
++        assert_eq!(read(&mut m, &mut h, p(0, 0x4670)), 0x30924);
++        assert_eq!(read(&mut m, &mut h, p(0, 0x444c)), 0x00020001);
++        assert_eq!(m.next_deadline(0), None);
++        m.validate_checkpoint(&m.checkpoint().unwrap()).unwrap();
++        refused(&mut m, &mut h, p(0, 0), 0);
++        refused(&mut m, &mut h, q(0, 0x5000), 1);
++        refused(&mut m, &mut h, q(1, 0x7c18), 0x40000000);
++        for (a, size) in [
++            (p(1, 0x4670), 4),
++            (p(1, 0x10000), 4),
++            (p(1, 0), 1),
++            (0xff640000, 4),
++        ] {
++            let mut cx = h.cx();
++            m.read(&mut cx, a, size);
++            assert!(cx.refusal().is_some());
++        }
++    }
++
++    #[test]
++    fn independent_units_and_masked_results_preserve_source_words() {
++        let mut c = config();
++        for (off, value) in &mut c.initial_script {
++            if *off == 0x444c {
++                *value = 0x80008000;
++            }
++            if *off == 0x40dc {
++                *value = 0x20000080;
++            }
++        }
++        c.source_sha256 = source_hash(&c);
++        let mut m = BankedCalibration::new(c).unwrap();
++        let mut h = TestHost::new();
++        controller(&mut m, &mut h, 1);
++        assert_eq!(read(&mut m, &mut h, p(1, 0x444c)), 0x80068005);
++        assert_eq!(read(&mut m, &mut h, p(1, 0x40dc)), 0x20000380);
++        assert!(m.pollable(p(1, 0x4480), 4));
++        assert!(!m.pollable(q(1, 0x7364), 4));
++        program(&mut m, &mut h, 2);
++        program(&mut m, &mut h, 3);
++        write(&mut m, &mut h, q(2, 0x7c18), 0x40000000);
++        write(&mut m, &mut h, q(3, 0x7c18), 0x40000000);
++        let saved = m.checkpoint().unwrap();
++        m.validate_checkpoint(&saved).unwrap();
++        let token = m.state.units[2].pending.as_ref().unwrap().token;
++        h.now = 40;
++        m.event(&mut h.cx(), token);
++        assert_eq!(read(&mut m, &mut h, p(2, 0x4670)), 0x30924);
++        assert_eq!(read(&mut m, &mut h, p(3, 0x4670)), 0x924);
++        m.restore_checkpoint(&saved).unwrap();
++        advance(&mut m, &mut h, 40);
++        assert_eq!(read(&mut m, &mut h, p(3, 0x4670)), 0x30924);
++        m.validate_checkpoint(&m.checkpoint().unwrap()).unwrap();
++    }
++
++    fn cold_complete(m: &mut BankedCalibration, h: &mut TestHost, unit: usize) {
++        controller(m, h, unit);
++        write(m, h, q(unit, 0x7360), 0xff00c00d);
++        let at = h.now + 8;
++        advance(m, h, at);
++        write(m, h, q(unit, 0x7364), 1);
++        for (o, v) in FINAL {
++            write(m, h, q(unit, o), v);
++        }
++        assert_eq!(m.state.units[unit].stage, Stage::Complete);
++    }
++
++    #[test]
++    fn mode5_requires_each_units_whole_script_and_completes_at_eight_ticks() {
++        let mut c = config();
++        c.unit0_preinitialized = true;
++        let mut m = BankedCalibration::new(c).unwrap();
++        let mut h = TestHost::new();
++        for unit in 1..4 {
++            cold_complete(&mut m, &mut h, unit);
++        }
++        let primary: Vec<_> = m.state.units.iter().map(|u| u.primary.clone()).collect();
++        for unit in 0..4 {
++            refused(&mut m, &mut h, q(unit, 0x5384), 1);
++            for (n, (a, v)) in m.config.mode5_scripts[unit][..70]
++                .to_vec()
++                .into_iter()
++                .enumerate()
++            {
++                write(&mut m, &mut h, a.into(), v);
++                assert_eq!(m.state.units[unit].stage, Stage::Mode5(n + 1));
++                assert_eq!(m.next_deadline(h.now), None);
++                assert!(!m.pollable(q(unit, 0x5384), 4));
++                m.validate_checkpoint(&m.checkpoint().unwrap()).unwrap();
++                if n == 22 {
++                    let wrong = m.config.mode5_scripts[(unit + 1) % 4][23].1;
++                    refused(&mut m, &mut h, q(unit, 0x5200), wrong);
++                }
++            }
++            let started = h.now;
++            write(&mut m, &mut h, q(unit, 0x5384), 1);
++            assert_eq!(read(&mut m, &mut h, q(unit, 0x5384)), 1);
++            let token = m.state.units[unit].pending.as_ref().unwrap().token;
++            h.now = started + 3;
++            write(&mut m, &mut h, q(unit, 0x5384), 1);
++            assert_eq!(m.next_deadline(h.now), Some(started + 8));
++            refused(&mut m, &mut h, q(unit, 0x5384), 0);
++            m.event(&mut h.cx(), token - 1);
++            advance(&mut m, &mut h, started + 7);
++            assert_eq!(read(&mut m, &mut h, q(unit, 0x5384)), 1);
++            advance(&mut m, &mut h, started + 8);
++            assert_eq!(read(&mut m, &mut h, q(unit, 0x5384)), 0);
++            assert_eq!(m.state.units[unit].stage, Stage::Mode5Done);
++            assert_eq!(m.next_deadline(h.now), None);
++            m.validate_checkpoint(&m.checkpoint().unwrap()).unwrap();
++            refused(&mut m, &mut h, q(unit, 0x5384), 1);
++            refused(&mut m, &mut h, q(unit, 0x5000), 0x01004100);
++            assert_eq!(m.state.units[unit].primary, primary[unit]);
++        }
++        assert_eq!(m.state.generation, 19); // 3 cold units *5 plus 4 mode5 events.
++    }
++
++    #[test]
++    fn mode5_checkpoint_prefix_pending_done_and_configuration_are_bounded() {
++        let mut c = config();
++        c.unit0_preinitialized = true;
++        let mut m = BankedCalibration::new(c.clone()).unwrap();
++        let mut h = TestHost::new();
++        for (a, v) in c.mode5_scripts[0][..30].to_vec() {
++            write(&mut m, &mut h, a.into(), v);
++        }
++        let prefix = m.checkpoint().unwrap();
++        let mut restored = BankedCalibration::new(c.clone()).unwrap();
++        restored.restore_checkpoint(&prefix).unwrap();
++        assert_eq!(m.save(), restored.save());
++        for (a, v) in c.mode5_scripts[0][30..].to_vec() {
++            write(&mut m, &mut h, a.into(), v);
++        }
++        let pending = m.checkpoint().unwrap();
++        restored.restore_checkpoint(&pending).unwrap();
++        assert_eq!(restored.next_deadline(0), Some(8));
++        let token = m.state.units[0].pending.as_ref().unwrap().token;
++        m.restore_checkpoint(&prefix).unwrap();
++        h.now = 8;
++        m.event(&mut h.cx(), token);
++        assert!(!m.pollable(q(0, 0x5384), 4));
++        advance(&mut restored, &mut h, 8);
++        assert_eq!(read(&mut restored, &mut h, q(0, 0x5384)), 0);
++        m.restore_checkpoint(&restored.checkpoint().unwrap())
++            .unwrap();
++        assert_eq!(m.state.units[0].stage, Stage::Mode5Done);
++        for malformed in 0..7 {
++            let mut bad: State = pending.decode(NAME).unwrap();
++            match malformed {
++                0 => bad.units[0].stage = Stage::Mode5(usize::MAX),
++                1 => bad.units[0].stage = Stage::Mode5(0),
++                2 => bad.units[0].pending.as_mut().unwrap().due += 1,
++                3 => bad.units[0].paired.insert(0x5384, 0).map(|_| ()).unwrap(),
++                4 => bad.generation += 1,
++                5 => bad.units[0].pending.as_mut().unwrap().action = Action::Finalize,
++                _ => bad.units[0].stage = Stage::Mode5Done,
++            }
++            let before = m.save();
++            assert!(
++                m.restore_checkpoint(&Checkpoint::encode(NAME, &bad).unwrap())
++                    .is_err()
++            );
++            assert_eq!(m.save(), before);
++        }
++        c.mode5_scripts[0][23].1 = 7;
++        c.mode5_sha256 = mode5_hash(&c);
++        let other = BankedCalibration::new(c).unwrap();
++        assert!(other.validate_checkpoint(&pending).is_err());
++        assert!(m.save()["identity"].get("mode5_scripts").is_none());
++    }
++
++    #[test]
++    fn mode5_input_grammar_and_hash_and_cold_dependency_are_strict() {
++        for malformed in 0..9 {
++            let mut c = config();
++            match malformed {
++                0 => {
++                    c.mode5_scripts[0].pop();
++                }
++                1 => c.mode5_scripts[1][0].0 = 0xff505000,
++                2 => c.mode5_scripts[0][23].1 = 8,
++                3 => c.mode5_scripts[0][46].1 = 1,
++                4 => c.mode5_scripts[0][47].1 = 0x80,
++                5 => c.mode5_scripts[0][70].1 = 0,
++                6 => c.mode5_scripts[0].swap(0, 1),
++                7 => c.mode5_scripts[0][0].0 += 1,
++                _ => c.mode5_sha256 = "0".repeat(64),
++            }
++            if malformed != 8 {
++                c.mode5_sha256 = mode5_hash(&c);
++            }
++            assert!(BankedCalibration::new(c).is_err());
++        }
++        let mut m = BankedCalibration::new(config()).unwrap();
++        let mut h = TestHost::new();
++        refused(&mut m, &mut h, q(0, 0x5000), 0x01004100);
++    }
++
++    fn mode5_done(m: &mut BankedCalibration, h: &mut TestHost, unit: usize) {
++        for (a, v) in m.config.mode5_scripts[unit].clone() {
++            write(m, h, a.into(), v);
++        }
++        let at = h.now + 8;
++        advance(m, h, at);
++        assert_eq!(m.state.units[unit].stage, Stage::Mode5Done);
++    }
++
++    #[test]
++    fn removal_is_unit_independent_complete_ordered_delayed_and_masked() {
++        let mut c = config();
++        c.unit0_preinitialized = true;
++        // Known nonstatus bits survive the synthetic bit0 busy/completion convention.
++        c.profile[0] = (0x7090, 0x80);
++        c.source_sha256 = source_hash(&c);
++        let mut m = BankedCalibration::new(c).unwrap();
++        let mut h = TestHost::new();
++        for unit in 1..4 {
++            cold_complete(&mut m, &mut h, unit);
++        }
++        for unit in 0..4 {
++            mode5_done(&mut m, &mut h, unit);
++        }
++        let primary: Vec<_> = m.state.units.iter().map(|u| u.primary.clone()).collect();
++        for unit in 0..4 {
++            let mode5: Vec<_> = m.config.mode5_scripts[unit]
++                .iter()
++                .map(|(a, _)| {
++                    let o = a & 0xffff;
++                    (o, m.state.units[unit].paired[&o])
++                })
++                .collect();
++            assert_eq!(read(&mut m, &mut h, q(unit, 0x7090)), 0x80);
++            refused(&mut m, &mut h, q(unit, 0x7080), 0x100);
++            refused(&mut m, &mut h, q(unit, 0x7c40), 0x80000000);
++            for (n, (o, v)) in m.config.removal_script.clone().into_iter().enumerate() {
++                write(&mut m, &mut h, q(unit, o), v);
++                assert_eq!(m.state.units[unit].stage, Stage::Removal(n + 1));
++                assert_eq!(m.next_deadline(h.now), None);
++                assert_eq!(read(&mut m, &mut h, q(unit, 0x7090)), 0x80);
++                m.validate_checkpoint(&m.checkpoint().unwrap()).unwrap();
++                if n != 2 {
++                    refused(&mut m, &mut h, q(unit, 0x7080), 0x100);
++                }
++            }
++            // Six firmware save reads have no extra ordering constraint or rewriting.
++            for o in [0x448c, 0x4660, 0x4480, 0x4488, 0x4664, 0x4484] {
++                assert_eq!(
++                    read(&mut m, &mut h, p(unit, o)),
++                    u64::from(primary[unit][&o])
++                );
++            }
++            let started = h.now;
++            write(&mut m, &mut h, q(unit, 0x7080), 0x100);
++            let token = m.state.units[unit].pending.as_ref().unwrap().token;
++            h.now = started + 3;
++            write(&mut m, &mut h, q(unit, 0x7080), 0x100);
++            assert_eq!(m.next_deadline(h.now), Some(started + 8));
++            refused(&mut m, &mut h, q(unit, 0x7080), 0);
++            m.event(&mut h.cx(), token - 1);
++            advance(&mut m, &mut h, started + 7);
++            assert_eq!(read(&mut m, &mut h, q(unit, 0x7090)), 0x80);
++            advance(&mut m, &mut h, started + 8);
++            assert_eq!(read(&mut m, &mut h, q(unit, 0x7090)), 0x81);
++            assert_eq!(m.state.units[unit].stage, Stage::Removed);
++            assert_eq!(m.next_deadline(h.now), None);
++            assert_eq!(m.state.units[unit].primary, primary[unit]);
++            for (o, v) in mode5 {
++                assert_eq!(m.state.units[unit].paired[&o], v);
++            }
++            for other in unit + 1..4 {
++                assert_eq!(m.state.units[other].stage, Stage::Mode5Done);
++            }
++            m.validate_checkpoint(&m.checkpoint().unwrap()).unwrap();
++            for (o, v) in [
++                (0x7114, 0),
++                (0x7080, 0x100),
++                (0x5000, 0x01004100),
++                (0x7c18, 0x40000000),
++            ] {
++                refused(&mut m, &mut h, q(unit, o), v);
++            }
++        }
++        assert_eq!(m.state.generation, 23);
++    }
++
++    #[test]
++    fn removal_checkpoint_prefix_pending_removed_and_invalid_tokens_are_checked() {
++        let mut c = config();
++        c.unit0_preinitialized = true;
++        let mut m = BankedCalibration::new(c.clone()).unwrap();
++        let mut h = TestHost::new();
++        mode5_done(&mut m, &mut h, 0);
++        write(&mut m, &mut h, q(0, 0x7114), 0);
++        let prefix = m.checkpoint().unwrap();
++        let mut fresh = BankedCalibration::new(c).unwrap();
++        fresh.restore_checkpoint(&prefix).unwrap();
++        assert_eq!(fresh.save(), m.save());
++        for (o, v) in m.config.removal_script[1..].to_vec() {
++            write(&mut m, &mut h, q(0, o), v);
++        }
++        write(&mut m, &mut h, q(0, 0x7080), 0x100);
++        let pending = m.checkpoint().unwrap();
++        fresh.restore_checkpoint(&pending).unwrap();
++        assert_eq!(fresh.next_deadline(h.now), Some(16));
++        let token = m.state.units[0].pending.as_ref().unwrap().token;
++        m.restore_checkpoint(&prefix).unwrap();
++        h.now = 16;
++        m.event(&mut h.cx(), token);
++        assert_eq!(read(&mut m, &mut h, q(0, 0x7090)), 0);
++        advance(&mut fresh, &mut h, 16);
++        m.restore_checkpoint(&fresh.checkpoint().unwrap()).unwrap();
++        assert_eq!(m.state.units[0].stage, Stage::Removed);
++        for malformed in 0..10 {
++            let mut bad: State = pending.decode(NAME).unwrap();
++            match malformed {
++                0 => bad.units[0].stage = Stage::Removal(0),
++                1 => bad.units[0].stage = Stage::Removal(usize::MAX),
++                2 => bad.units[0].pending.as_mut().unwrap().token = 0,
++                3 => bad.units[0].pending.as_mut().unwrap().token = 1,
++                4 => bad.units[0].pending.as_mut().unwrap().due += 1,
++                5 => bad.units[0].paired.insert(0x7090, 1).map(|_| ()).unwrap(),
++                6 => bad.generation += 1,
++                7 => bad.identity.removal_sha256 = "0".repeat(64),
++                8 => bad.units[0].pending.as_mut().unwrap().action = Action::Mode5,
++                _ => bad.units[0].stage = Stage::Removed,
++            }
++            let before = m.save();
++            assert!(
++                m.restore_checkpoint(&Checkpoint::encode(NAME, &bad).unwrap())
++                    .is_err()
++            );
++            assert_eq!(m.save(), before);
++        }
++        assert!(m.save()["identity"].get("removal_script").is_none());
++    }
++
++    #[test]
++    fn removal_configuration_and_mode5_dependency_are_exact() {
++        for malformed in 0..6 {
++            let mut c = config();
++            match malformed {
++                0 => {
++                    c.removal_script.pop();
++                }
++                1 => c.removal_script.swap(0, 1),
++                2 => c.removal_script[0].0 = 0xff507114,
++                3 => c.removal_script[2].1 = 0,
++                4 => c.removal_poll[3] = 3,
++                _ => c.removal_sha256 = "0".repeat(64),
++            }
++            if malformed != 5 {
++                c.removal_sha256 = removal_hash(&c);
++            }
++            assert!(BankedCalibration::new(c).is_err());
++        }
++        let mut c = config();
++        c.unit0_preinitialized = true;
++        let mut m = BankedCalibration::new(c).unwrap();
++        let mut h = TestHost::new();
++        refused(&mut m, &mut h, q(0, 0x7114), 0);
++        refused(&mut m, &mut h, q(1, 0x7114), 0);
++        let (a, v) = m.config.mode5_scripts[0][0];
++        write(&mut m, &mut h, a.into(), v);
++        refused(&mut m, &mut h, q(0, 0x7114), 0);
++    }
++
++    fn mode2_hash(mode2: &Mode2) -> String {
++        let bytes: Vec<u8> = mode2
++            .scripts
++            .iter()
++            .flatten()
++            .flat_map(|(a, v)| a.to_le_bytes().into_iter().chain(v.to_le_bytes()))
++            .collect();
++        fujimod_emulator_devices::fingerprint::bytes(&bytes)["sha256"]
++            .as_str()
++            .unwrap()
++            .to_owned()
++    }
++    fn mode2_config() -> Config {
++        let mut c = config();
++        let mut mode2 = Mode2 {
++            scripts: c.mode5_scripts.clone(),
++            source_sha256: String::new(),
++        };
++        for (unit, script) in mode2.scripts.iter_mut().enumerate() {
++            for (n, (_, v)) in script[23..46].iter_mut().enumerate() {
++                *v = match unit {
++                    0 => n as u32 % 8,
++                    1 | 2 => [0, 1, 2, 5][n % 4],
++                    _ => n as u32 % 5,
++                };
++            }
++            if matches!(unit, 1 | 2) {
++                script[1].1 = 0x09004600;
++                script[7].1 = 0x05004200;
++                script[48].1 = 0x83;
++                script[65].1 = 0xa1;
++            } else if unit == 3 {
++                script[65].1 = 0xa1;
++            }
++        }
++        mode2.source_sha256 = mode2_hash(&mode2);
++        c.mode2 = Some(mode2);
++        c.unit0_preinitialized = true;
++        c
++    }
++    fn mode2_prefix(
++        m: &mut BankedCalibration,
++        h: &mut TestHost,
++        unit: usize,
++        start: usize,
++        end: usize,
++    ) {
++        for (a, v) in m.config.mode2.as_ref().unwrap().scripts[unit][start..end].to_vec() {
++            write(m, h, a.into(), v);
++        }
++    }
++
++    #[test]
++    fn mode2_each_unit_is_ordered_single_use_and_only_completion_changes_5384() {
++        let mut m = BankedCalibration::new(mode2_config()).unwrap();
++        let mut h = TestHost::new();
++        for unit in 1..4 {
++            cold_complete(&mut m, &mut h, unit);
++        }
++        for unit in 0..4 {
++            mode5_done(&mut m, &mut h, unit);
++        }
++        for unit in 0..4 {
++            let others: Vec<_> = m
++                .state
++                .units
++                .iter()
++                .enumerate()
++                .filter(|(i, _)| *i != unit)
++                .map(|(i, u)| (i, u.clone()))
++                .collect();
++            refused(&mut m, &mut h, q(unit, 0x5384), 1);
++            refused(&mut m, &mut h, q(unit, 0x5004), 0x01004100);
++            for n in 0..70 {
++                let (a, v) = m.config.mode2.as_ref().unwrap().scripts[unit][n];
++                refused(&mut m, &mut h, a.into(), v ^ 0x10);
++                write(&mut m, &mut h, a.into(), v);
++                assert_eq!(m.state.units[unit].stage, Stage::Mode2(n + 1));
++                assert_eq!(m.next_deadline(h.now), None);
++                m.validate_checkpoint(&m.checkpoint().unwrap()).unwrap();
++            }
++            let started = h.now;
++            mode2_prefix(&mut m, &mut h, unit, 70, 71);
++            let p = m.state.units[unit].pending.clone().unwrap();
++            assert_eq!(p.action, Action::Mode2);
++            assert_eq!(p.due, started + 8);
++            let pending = m.save();
++            write(&mut m, &mut h, q(unit, 0x5384), 1);
++            assert_eq!(m.save(), pending);
++            refused(&mut m, &mut h, q(unit, 0x5384), 0);
++            refused(&mut m, &mut h, q(unit, 0x5000), 0x01004100);
++            m.event(&mut h.cx(), p.token + 1);
++            advance(&mut m, &mut h, started + 7);
++            assert_eq!(read(&mut m, &mut h, q(unit, 0x5384)), 1);
++            let mut expected = m.state.units[unit].paired.clone();
++            expected.insert(0x5384, 0);
++            advance(&mut m, &mut h, started + 8);
++            assert_eq!(m.state.units[unit].stage, Stage::Mode2Done);
++            assert_eq!(m.state.units[unit].paired, expected);
++            assert_eq!(read(&mut m, &mut h, q(unit, 0x5384)), 0);
++            assert_eq!(m.next_deadline(h.now), None);
++            m.validate_checkpoint(&m.checkpoint().unwrap()).unwrap();
++            refused(&mut m, &mut h, q(unit, 0x5000), 0x01004100);
++            refused(&mut m, &mut h, q(unit, 0x7114), 0);
++            refused(&mut m, &mut h, q(unit, 0x5384), 1);
++            for (i, before) in others {
++                assert_eq!(m.state.units[i], before);
++            }
++        }
++        assert_eq!(m.state.generation, 23);
++    }
++
++    #[test]
++    fn mode2_and_existing_removal_are_independent_and_pending_tokens_cannot_alias() {
++        let c = mode2_config();
++        let mut m = BankedCalibration::new(c.clone()).unwrap();
++        let mut h = TestHost::new();
++        for unit in 1..4 {
++            cold_complete(&mut m, &mut h, unit);
++        }
++        for unit in 0..4 {
++            mode5_done(&mut m, &mut h, unit);
++        }
++        mode2_prefix(&mut m, &mut h, 0, 0, 30);
++        let unit0 = m.state.units[0].clone();
++        for (o, v) in c.removal_script.clone() {
++            write(&mut m, &mut h, q(1, o), v);
++        }
++        write(&mut m, &mut h, q(1, 0x7080), 0x100);
++        let due = h.now + 8;
++        advance(&mut m, &mut h, due);
++        assert_eq!(m.state.units[1].stage, Stage::Removed);
++        assert_eq!(m.state.units[0], unit0);
++        refused(&mut m, &mut h, q(1, 0x5000), 0x01004100);
++        mode2_prefix(&mut m, &mut h, 0, 30, 71);
++        mode2_prefix(&mut m, &mut h, 2, 0, 71);
++        let saved = m.checkpoint().unwrap();
++        let mut restored = BankedCalibration::new(c).unwrap();
++        restored.restore_checkpoint(&saved).unwrap();
++        let mut bad: State = saved.decode(NAME).unwrap();
++        bad.units[2].pending.as_mut().unwrap().token = bad.units[0].pending.as_ref().unwrap().token;
++        let before = restored.save();
++        assert!(
++            restored
++                .restore_checkpoint(&Checkpoint::encode(NAME, &bad).unwrap())
++                .is_err()
++        );
++        assert_eq!(restored.save(), before);
++        let due = h.now + 8;
++        advance(&mut restored, &mut h, due);
++        assert_eq!(restored.state.units[0].stage, Stage::Mode2Done);
++        assert_eq!(restored.state.units[2].stage, Stage::Mode2Done);
++        assert_eq!(restored.state.units[1].stage, Stage::Removed);
++        assert_eq!(restored.state.units[3].stage, Stage::Mode5Done);
++        restored
++            .validate_checkpoint(&restored.checkpoint().unwrap())
++            .unwrap();
++    }
++
++    #[test]
++    fn mode2_checkpoint_identity_prefix_pending_and_done_validate_before_commit() {
++        let c = mode2_config();
++        let mut disabled = c.clone();
++        disabled.mode2 = None;
++        let mut old = BankedCalibration::new(disabled).unwrap();
++        let mut m = BankedCalibration::new(c.clone()).unwrap();
++        assert!(old.save()["identity"].get("mode2_sha256").is_none());
++        assert_eq!(old.save()["identity"].as_object().unwrap().len(), 6);
++        assert!(m.restore_checkpoint(&old.checkpoint().unwrap()).is_err());
++        assert!(old.restore_checkpoint(&m.checkpoint().unwrap()).is_err());
++        let mut h = TestHost::new();
++        mode5_done(&mut m, &mut h, 0);
++        mode2_prefix(&mut m, &mut h, 0, 0, 35);
++        let prefix = m.checkpoint().unwrap();
++        let mut restored = BankedCalibration::new(c.clone()).unwrap();
++        restored.restore_checkpoint(&prefix).unwrap();
++        assert_eq!(restored.save(), m.save());
++        mode2_prefix(&mut m, &mut h, 0, 35, 71);
++        let pending = m.checkpoint().unwrap();
++        restored.restore_checkpoint(&pending).unwrap();
++        for malformed in 0..15 {
++            let mut bad: State = pending.decode(NAME).unwrap();
++            match malformed {
++                0 => bad.units[0].stage = Stage::Mode2(0),
++                1 => bad.units[0].stage = Stage::Mode2(71),
++                2 => bad.units[0].stage = Stage::Mode2(usize::MAX),
++                3 => bad.identity.mode2_sha256 = None,
++                4 => bad.units[0].pending.as_mut().unwrap().action = Action::Mode5,
++                5 => bad.units[0].pending.as_mut().unwrap().token = 0,
++                6 => bad.units[0].pending.as_mut().unwrap().token = bad.generation + 1,
++                7 => bad.units[0].pending.as_mut().unwrap().due += 1,
++                8 => bad.units[0].pending.as_mut().unwrap().started = u64::MAX,
++                9 => bad.units[0].pending = None,
++                10 => {
++                    bad.units[0].paired.insert(0x5384, 0);
++                }
++                11 => {
++                    bad.units[0].paired.insert(0x5000, 0);
++                }
++                12 => bad.generation += 1,
++                13 => bad.units[0].stage = Stage::Mode2Done,
++                _ => bad.identity.mode2_sha256 = Some("0".repeat(64)),
++            }
++            let before = restored.save();
++            assert!(
++                restored
++                    .restore_checkpoint(&Checkpoint::encode(NAME, &bad).unwrap())
++                    .is_err()
++            );
++            assert_eq!(restored.save(), before);
++        }
++        let mut unknown = m.save();
++        unknown["identity"]["unknown"] = serde_json::json!(0);
++        let before = restored.save();
++        assert!(
++            restored
++                .restore_checkpoint(&Checkpoint::encode(NAME, &unknown).unwrap())
++                .is_err()
++        );
++        assert_eq!(restored.save(), before);
++        let due = h.now + 8;
++        advance(&mut restored, &mut h, due);
++        m.restore_checkpoint(&restored.checkpoint().unwrap())
++            .unwrap();
++        assert_eq!(m.state.units[0].stage, Stage::Mode2Done);
++        let mut changed = c;
++        changed.mode2.as_mut().unwrap().scripts[0][23].1 = 7;
++        let mode2 = changed.mode2.as_mut().unwrap();
++        mode2.source_sha256 = mode2_hash(mode2);
++        let other = BankedCalibration::new(changed).unwrap();
++        assert!(other.validate_checkpoint(&pending).is_err());
++        assert!(m.save()["identity"].get("mode2").is_none());
++        assert!(m.save()["identity"].get("mode2_scripts").is_none());
++    }
++
++    #[test]
++    fn mode2_configuration_grammar_and_hash_reject_wrong_units_values_and_order() {
++        for malformed in 0..15 {
++            let mut c = mode2_config();
++            let mode2 = c.mode2.as_mut().unwrap();
++            match malformed {
++                0 => {
++                    mode2.scripts[0].pop();
++                }
++                1 => mode2.scripts[1][0].0 = 0xff505000,
++                2 => mode2.scripts[0].swap(0, 1),
++                3 => mode2.scripts[1][1].1 = 0x05004100,
++                4 => mode2.scripts[2][1].1 = 0x09004100,
++                5 => mode2.scripts[0][0].1 = 0x05004200,
++                6 => mode2.scripts[0][23].1 = 8,
++                7 => mode2.scripts[1][23].1 = 3,
++                8 => mode2.scripts[2][23].1 = 4,
++                9 => mode2.scripts[3][23].1 = 5,
++                10 => mode2.scripts[0][46].1 = 1,
++                11 => mode2.scripts[0][47].1 = 0x83,
++                12 => mode2.scripts[3][47].1 = 0x83,
++                13 => mode2.scripts[0][70].1 = 0,
++                _ => mode2.source_sha256 = "0".repeat(64),
++            }
++            if malformed != 14 {
++                mode2.source_sha256 = mode2_hash(mode2);
++            }
++            assert!(BankedCalibration::new(c).is_err(), "case {malformed}");
++        }
++        let mut m = BankedCalibration::new(mode2_config()).unwrap();
++        let mut h = TestHost::new();
++        refused(&mut m, &mut h, q(1, 0x5000), 0x01004100);
++        // A shared first pair at Complete still belongs to the unchanged mode5 path.
++        write(&mut m, &mut h, q(0, 0x5000), 0x01004100);
++        assert_eq!(m.state.units[0].stage, Stage::Mode5(1));
++    }
++
++    #[test]
++    fn mode2_overflow_refuses_the_last_write_without_mutation_or_pending() {
++        let mut m = BankedCalibration::new(mode2_config()).unwrap();
++        let mut h = TestHost::new();
++        mode5_done(&mut m, &mut h, 0);
++        mode2_prefix(&mut m, &mut h, 0, 0, 70);
++        h.now = u64::MAX - 7;
++        refused(&mut m, &mut h, q(0, 0x5384), 1);
++        assert_eq!(m.next_deadline(h.now), None);
++        h.now = 100;
++        m.state.generation = u64::MAX;
++        refused(&mut m, &mut h, q(0, 0x5384), 1);
++        assert_eq!(m.state.units[0].stage, Stage::Mode2(70));
++        assert!(m.state.units[0].pending.is_none());
++    }
++
++    fn reprogram_config() -> Config {
++        let mut c = config();
++        c.unit0_preinitialized = true;
++        // Synthetic high status bits must survive the two new masked events.
++        c.profile[0] = (0x7090, 0xa5a580);
++        c.source_sha256 = source_hash(&c);
++        let mut r = Reprogram {
++            profile: c.profile.iter().map(|&(o, v)| (o, v ^ 0x100)).collect(),
++            cached: [Some([
++                0x12345678, 0x98765432, 0x89abcdef, 0x87654321, 0xfedcba98, 0x76543210,
++            ]); 4],
++            input_sha256: String::new(),
++        };
++        r.input_sha256 = r.hash();
++        c.reprogram = Some(r);
++        c
++    }
++
++    fn removed(m: &mut BankedCalibration, h: &mut TestHost, unit: usize) {
++        if m.state.units[unit].stage != Stage::Complete {
++            cold_complete(m, h, unit);
++        }
++        mode5_done(m, h, unit);
++        for (o, v) in m.config.removal_script.clone() {
++            write(m, h, q(unit, o), v);
++        }
++        write(m, h, q(unit, 0x7080), 0x100);
++        let at = h.now + 8;
++        advance(m, h, at);
++        assert_eq!(m.state.units[unit].stage, Stage::Removed);
++    }
++
++    fn reprogram_prefix(m: &mut BankedCalibration, h: &mut TestHost, unit: usize, count: usize) {
++        for (n, (paired, off, value)) in m.reprogram_plans[unit]
++            .clone()
++            .unwrap()
++            .into_iter()
++            .take(count)
++            .enumerate()
++        {
++            write(
++                m,
++                h,
++                if paired { q(unit, off) } else { p(unit, off) },
++                value,
++            );
++            m.validate_checkpoint(&m.checkpoint().unwrap()).unwrap();
++            if let Some(action) = BankedCalibration::reprogram_action(n) {
++                assert_eq!(m.state.units[unit].stage, Stage::Pending(action));
++                let at = h.now + 8;
++                advance(m, h, at);
++                m.validate_checkpoint(&m.checkpoint().unwrap()).unwrap();
++            }
++        }
++    }
++
++    #[test]
++    fn reprogram_all_units_preserve_history_retention_and_current_prefix_rmw() {
++        let mut m = BankedCalibration::new(reprogram_config()).unwrap();
++        let mut h = TestHost::new();
++        for i in 0..4 {
++            removed(&mut m, &mut h, i);
++        }
++        assert_eq!(m.state.generation, 23);
++        let baseline = m.state.units.clone();
++        for unit in 0..4 {
++            let plan = m.reprogram_plans[unit].clone().unwrap();
++            assert_eq!(plan.len(), 730);
++            assert_eq!(plan[722], (true, 0x7040, 0x100));
++            assert_eq!(plan[727], (true, 0x7080, 0x100));
++            assert_eq!(plan[729], (true, 0x7c18, 0x40000000));
++            let cache = m.config.reprogram.as_ref().unwrap().cached[unit].unwrap();
++            assert_eq!(
++                plan[716],
++                (
++                    false,
++                    0x4660,
++                    (0x03000004 & !0x07ff0000) | (cache[0] & 0x07ff0000)
++                )
++            );
++            assert_ne!(
++                baseline[unit].primary[&0x4660] & 0xffff,
++                plan[716].2 & 0xffff
++            );
++            let others = m.state.units.clone();
++            reprogram_prefix(&mut m, &mut h, unit, 730);
++            let u = &m.state.units[unit];
++            assert_eq!(u.stage, Stage::ReprogramDone);
++            assert_eq!(u.paired[&0x7c18], 0x40000000);
++            assert_eq!(u.paired[&0x7090], 0xa5a401);
++            assert_eq!(u.primary[&0x4670] & 0x30000, 0x30000);
++            // Fields never in this plan preserve the canonical Removed values.
++            for (&o, &v) in &baseline[unit].paired {
++                if !plan.iter().any(|&(paired, off, _)| paired && off == o)
++                    && ![0x7044, 0x7090].contains(&o)
++                {
++                    assert_eq!(u.paired[&o], v, "retained {o:x}");
++                }
++            }
++            for (i, other) in others.iter().enumerate() {
++                if i != unit {
++                    assert_eq!(&m.state.units[i], other);
++                }
++            }
++            refused(&mut m, &mut h, q(unit, 0x7114), 0);
++            refused(&mut m, &mut h, p(unit, 0x2000), 0xb00);
++        }
++        assert_eq!(m.state.generation, 35);
++    }
++
++    #[test]
++    fn reprogram_events_are_distinct_delayed_masked_repeat_safe_and_independent() {
++        let mut m = BankedCalibration::new(reprogram_config()).unwrap();
++        let mut h = TestHost::new();
++        for i in 0..2 {
++            removed(&mut m, &mut h, i);
++            reprogram_prefix(&mut m, &mut h, i, 722);
++        }
++        let old_generation = m.state.generation;
++        for i in 0..2 {
++            write(&mut m, &mut h, q(i, 0x7040), 0x100);
++        }
++        let first = m.state.units[0].pending.clone().unwrap();
++        let second = m.state.units[1].pending.clone().unwrap();
++        assert_ne!(first.token, second.token);
++        assert_eq!(m.state.generation, old_generation + 2);
++        assert_eq!(read(&mut m, &mut h, q(0, 0x7044)), 1);
++        write(&mut m, &mut h, q(0, 0x7040), 0x100);
++        assert_eq!(m.state.generation, old_generation + 2);
++        refused(&mut m, &mut h, q(0, 0x7040), 3);
++        m.event(&mut h.cx(), first.token - 1);
++        advance(&mut m, &mut h, first.due - 1);
++        assert_eq!(
++            m.state.units[0].stage,
++            Stage::Pending(Action::ReprogramClear)
++        );
++        h.now = first.due;
++        m.event(&mut h.cx(), first.token);
++        assert_eq!(read(&mut m, &mut h, q(0, 0x7044)), 0);
++        assert_eq!(
++            m.state.units[1].stage,
++            Stage::Pending(Action::ReprogramClear)
++        );
++        m.event(&mut h.cx(), second.token);
++        for (paired, o, v) in m.reprogram_plans[0].clone().unwrap()[723..728].to_vec() {
++            write(&mut m, &mut h, if paired { q(0, o) } else { p(0, o) }, v);
++        }
++        assert_eq!(read(&mut m, &mut h, q(0, 0x7090)), 0xa5a400);
++        let at = h.now + 8;
++        advance(&mut m, &mut h, at);
++        assert_eq!(read(&mut m, &mut h, q(0, 0x7090)), 0xa5a401);
++        write(&mut m, &mut h, q(0, 0x7c80), 2);
++        write(&mut m, &mut h, q(0, 0x7c18), 0x40000000);
++        let pending = m.save();
++        assert_eq!(read(&mut m, &mut h, p(0, 0x4670)) & 0x30000, 0);
++        let token = m.state.units[0].pending.as_ref().unwrap().token;
++        let at = h.now + 7;
++        advance(&mut m, &mut h, at);
++        assert_eq!(m.save(), pending);
++        let at = h.now + 1;
++        advance(&mut m, &mut h, at);
++        assert_eq!(read(&mut m, &mut h, p(0, 0x4670)) & 0x30000, 0x30000);
++        assert_eq!(read(&mut m, &mut h, q(0, 0x7c18)), 0x40000000);
++        let done = m.save();
++        m.event(&mut h.cx(), token);
++        assert_eq!(m.save(), done);
++    }
++
++    #[test]
++    fn reprogram_configuration_identity_and_exact_target_ownership() {
++        let c = reprogram_config();
++        let mut old = BankedCalibration::new(config()).unwrap();
++        assert!(old.save()["identity"].get("reprogram_sha256").is_none());
++        let fresh = BankedCalibration::new(c.clone()).unwrap();
++        let before = old.save();
++        assert!(
++            old.restore_checkpoint(&fresh.checkpoint().unwrap())
++                .is_err()
++        );
++        assert_eq!(old.save(), before);
++        for bad in 0..7 {
++            let mut c = c.clone();
++            let r = c.reprogram.as_mut().unwrap();
++            match bad {
++                0 => r.cached = [None; 4],
++                1 => {
++                    r.profile.pop();
++                }
++                2 => r.profile.swap(0, 1),
++                3 => r.profile[0].0 += 4,
++                4 => r.input_sha256 = "0".repeat(64),
++                5 => c.latency_ticks = 9,
++                _ => r.cached[0].as_mut().unwrap()[0] ^= 1,
++            }
++            if bad < 4 || bad == 5 {
++                c.reprogram.as_mut().unwrap().input_sha256 = c.reprogram.as_ref().unwrap().hash();
++            }
++            assert!(BankedCalibration::new(c).is_err(), "config {bad}");
++        }
++        let mut c = c.clone();
++        let r = c.reprogram.as_mut().unwrap();
++        r.cached[1] = None;
++        r.input_sha256 = r.hash();
++        let mut m = BankedCalibration::new(c).unwrap();
++        let mut h = TestHost::new();
++        refused(&mut m, &mut h, p(0, 0x2000), 0xb00); // Complete cannot start reprogram.
++        removed(&mut m, &mut h, 1);
++        refused(&mut m, &mut h, p(1, 0x2000), 0xb00);
++        removed(&mut m, &mut h, 0);
++        let (paired, o, v) = m.reprogram_plans[0].as_ref().unwrap()[0];
++        refused(&mut m, &mut h, if paired { p(0, o) } else { q(0, o) }, v);
++        refused(&mut m, &mut h, p(0, o), v ^ 1);
++        reprogram_prefix(&mut m, &mut h, 0, 1);
++        refused(&mut m, &mut h, p(0, o), v);
++    }
++
++    #[test]
++    fn reprogram_checkpoints_validate_prefix_events_identity_and_restore_atomically() {
++        let c = reprogram_config();
++        let mut m = BankedCalibration::new(c.clone()).unwrap();
++        let mut h = TestHost::new();
++        removed(&mut m, &mut h, 0);
++        reprogram_prefix(&mut m, &mut h, 0, 722);
++        let prefix = m.checkpoint().unwrap();
++        let mut fresh = BankedCalibration::new(c.clone()).unwrap();
++        fresh.restore_checkpoint(&prefix).unwrap();
++        assert_eq!(fresh.save(), m.save());
++        write(&mut m, &mut h, q(0, 0x7040), 0x100);
++        let pending = m.checkpoint().unwrap();
++        fresh.restore_checkpoint(&pending).unwrap();
++        for bad in 0..17 {
++            let mut state: State = pending.decode(NAME).unwrap();
++            match bad {
++                0 => state.units[0].stage = Stage::Reprogram(0),
++                1 => state.units[0].stage = Stage::Reprogram(730),
++                2 => state.units[0].stage = Stage::Reprogram(usize::MAX),
++                3 => state.units[0].stage = Stage::Reprogram(723),
++                4 => state.units[0].pending = None,
++                5 => state.units[0].pending.as_mut().unwrap().action = Action::Clear3,
++                6 => state.units[0].pending.as_mut().unwrap().due += 1,
++                7 => state.units[0].pending.as_mut().unwrap().token = 0,
++                8 => state.units[0].pending.as_mut().unwrap().token = 1,
++                9 => state.units[0].pending.as_mut().unwrap().token = state.generation + 1,
++                10 => state.units[0].paired.insert(0x7044, 0).map(|_| ()).unwrap(),
++                11 => {
++                    state.units[0].primary.insert(0x4660, 0);
++                }
++                12 => state.generation += 1,
++                13 => state.identity.reprogram_sha256 = None,
++                14 => state.identity.reprogram_sha256 = Some("0".repeat(64)),
++                15 => state.units.swap(0, 2),
++                _ => {
++                    state.units[0].paired.insert(0x5000, 0);
++                }
++            }
++            let before = fresh.save();
++            assert!(
++                fresh
++                    .restore_checkpoint(&Checkpoint::encode(NAME, &state).unwrap())
++                    .is_err(),
++                "state {bad}"
++            );
++            assert_eq!(fresh.save(), before);
++        }
++        let mut unknown: serde_json::Value =
++            serde_json::to_value(&pending.decode::<State>(NAME).unwrap()).unwrap();
++        unknown["units"][0]["unknown"] = 1.into();
++        assert!(serde_json::from_value::<State>(unknown).is_err());
++        let token = m.state.units[0].pending.as_ref().unwrap().token;
++        m.restore_checkpoint(&prefix).unwrap();
++        h.now += 8;
++        m.event(&mut h.cx(), token);
++        assert_eq!(m.state.units[0].stage, Stage::Reprogram(722));
++        let mut changed = c;
++        let r = changed.reprogram.as_mut().unwrap();
++        r.cached[0].as_mut().unwrap()[0] ^= 1;
++        r.input_sha256 = r.hash();
++        assert!(
++            BankedCalibration::new(changed)
++                .unwrap()
++                .restore_checkpoint(&pending)
++                .is_err()
++        );
++        fresh.restore_checkpoint(&pending).unwrap();
++        let at = h.now;
++        advance(&mut fresh, &mut h, at);
++        for (paired, o, v) in fresh.reprogram_plans[0].clone().unwrap()[723..].to_vec() {
++            write(
++                &mut fresh,
++                &mut h,
++                if paired { q(0, o) } else { p(0, o) },
++                v,
++            );
++            if fresh.state.units[0].pending.is_some() {
++                let at = h.now + 8;
++                advance(&mut fresh, &mut h, at);
++            }
++        }
++        assert_eq!(fresh.state.units[0].stage, Stage::ReprogramDone);
++        let done = fresh.checkpoint().unwrap();
++        m.restore_checkpoint(&done).unwrap();
++        assert_eq!(m.save(), fresh.save());
++    }
++
++    #[test]
++    fn reprogram_deadline_and_generation_overflow_reject_before_mutation() {
++        for overflow_generation in [false, true] {
++            let mut m = BankedCalibration::new(reprogram_config()).unwrap();
++            let mut h = TestHost::new();
++            removed(&mut m, &mut h, 0);
++            reprogram_prefix(&mut m, &mut h, 0, 722);
++            if overflow_generation {
++                m.state.generation = u64::MAX;
++            } else {
++                h.now = u64::MAX - 7;
++            }
++            refused(&mut m, &mut h, q(0, 0x7040), 0x100);
++            assert!(m.state.units[0].pending.is_none());
++        }
++    }
++
++    fn post_config() -> Config {
++        let mut c = reprogram_config();
++        let mut words: BTreeMap<_, _> = c.initial_script.iter().copied().collect();
++        for o in [0x40ec, 0x42ec, 0x40f8, 0x42f8] {
++            words.insert(o, 0);
++        }
++        for o in [
++            0x4138, 0x413c, 0x4140, 0x4144, 0x4338, 0x433c, 0x4340, 0x4344,
++        ] {
++            words.insert(o, 0x02800280);
++        }
++        for o in [0x4148, 0x4348] {
++            words.insert(o, 0x280);
++        }
++        while words.len() > 686 {
++            let k = *words.keys().next().unwrap();
++            words.remove(&k);
++        }
++        c.initial_script = words.into_iter().collect();
++        c.source_sha256 = source_hash(&c);
++        c.post_control_source_sha256 = Some("ab".repeat(32));
++        c
++    }
++
++    fn post_ready(m: &mut BankedCalibration, h: &mut TestHost, unit: usize) {
++        removed(m, h, unit);
++        reprogram_prefix(m, h, unit, 730);
++        assert_eq!(m.state.units[unit].stage, Stage::ReprogramDone);
++        assert_eq!(m.state.units[unit].paired[&0x7c18], 0x40000000);
++    }
++
++    #[test]
++    fn post_control_four_events_are_delayed_masked_ordered_and_do_not_reuse_cold_effects() {
++        let mut m = BankedCalibration::new(post_config()).unwrap();
++        let mut h = TestHost::new();
++        for unit in 0..4 {
++            post_ready(&mut m, &mut h, unit);
++            let old = m.state.units.clone();
++            let generation = m.state.generation;
++            for (n, (o, v)) in POST_CONTROL.into_iter().enumerate() {
++                refused(&mut m, &mut h, p(unit, o), v);
++                refused(&mut m, &mut h, q(unit, o), v ^ 1);
++                write(&mut m, &mut h, q(unit, o), v);
++                m.validate_checkpoint(&m.checkpoint().unwrap()).unwrap();
++                if let Some(action) = BankedCalibration::post_action(n) {
++                    let pending = m.state.units[unit].pending.clone().unwrap();
++                    assert_eq!(pending.action, action);
++                    assert_eq!(pending.due, h.now + 8);
++                    write(&mut m, &mut h, q(unit, o), v);
++                    assert_eq!(m.state.generation, generation + n as u64 + 1);
++                    refused(&mut m, &mut h, q(unit, 0x7c18), 0x40000000);
++                    let before = m.save();
++                    m.event(&mut h.cx(), pending.token + 100);
++                    assert_eq!(m.save(), before);
++                    let at = h.now + 7;
++                    advance(&mut m, &mut h, at);
++                    assert_eq!(m.save(), before);
++                    let at = h.now + 1;
++                    advance(&mut m, &mut h, at);
++                    let u = &m.state.units[unit];
++                    match n {
++                        0 => {
++                            assert_eq!(u.paired[&0x7c18], 1);
++                            assert_eq!(u.primary, old[unit].primary);
++                        }
++                        1 => assert_eq!(u.paired[&0x7090], old[unit].paired[&0x7090] & !1),
++                        2 => {
++                            assert_eq!(u.primary[&0x2110], old[unit].primary[&0x2110] | 1);
++                            for off in [0x40dc, 0x42dc] {
++                                assert_eq!(
++                                    u.primary[&off],
++                                    (old[unit].primary[&off] & !0x1300) | 0x300
++                                );
++                            }
++                            for off in [
++                                0x444c, 0x4620, 0x40ec, 0x42ec, 0x40f8, 0x42f8, 0x4138, 0x413c,
++                                0x4140, 0x4144, 0x4148, 0x4338, 0x433c, 0x4340, 0x4344, 0x4348,
++                            ] {
++                                assert_eq!(u.primary[&off], old[unit].primary[&off]);
++                            }
++                        }
++                        3 => assert_eq!(u.paired[&0x7364], 1),
++                        _ => unreachable!(),
++                    }
++                    let done = m.save();
++                    m.event(&mut h.cx(), pending.token);
++                    assert_eq!(m.save(), done);
++                }
++                let checkpoint = m.checkpoint().unwrap();
++                let mut fresh = BankedCalibration::new(m.config.clone()).unwrap();
++                fresh.restore_checkpoint(&checkpoint).unwrap();
++                assert_eq!(fresh.save(), m.save());
++            }
++            assert_eq!(m.state.units[unit].stage, Stage::PostControlDone);
++            assert!(!m.state.units[unit].paired.contains_key(&0x7364));
++            assert_eq!(m.state.generation, generation + 4);
++            for i in 0..4 {
++                if i != unit {
++                    assert_eq!(m.state.units[i], old[i]);
++                }
++            }
++            refused(&mut m, &mut h, q(unit, 0x7c50), 1);
++            refused(&mut m, &mut h, q(unit, 0x7114), 0);
++        }
++        assert_eq!(m.state.generation, 51);
++    }
++
++    #[test]
++    fn post_control_opt_in_identity_dependency_and_old_reprogram_completion_are_preserved() {
++        let mut old = BankedCalibration::new(reprogram_config()).unwrap();
++        let mut h = TestHost::new();
++        post_ready(&mut old, &mut h, 0);
++        assert!(
++            old.save()["identity"]
++                .get("post_control_source_sha256")
++                .is_none()
++        );
++        refused(&mut old, &mut h, q(0, 0x7c50), 1);
++        for bad in 0..7 {
++            let mut c = post_config();
++            match bad {
++                0 => c.reprogram = None,
++                1 => c.latency_ticks = 7,
++                2 => c.post_control_source_sha256 = Some(String::new()),
++                3 => c.post_control_source_sha256 = Some("a".repeat(63)),
++                4 => c.post_control_source_sha256 = Some("a".repeat(65)),
++                5 => c.post_control_source_sha256 = Some("gg".repeat(32)),
++                _ => c.post_control_source_sha256 = Some("AB".repeat(32)),
++            }
++            assert!(BankedCalibration::new(c).is_err(), "config {bad}");
++        }
++        let c = post_config();
++        let mut m = BankedCalibration::new(c.clone()).unwrap();
++        let saved = m.save();
++        assert!(m.restore_checkpoint(&old.checkpoint().unwrap()).is_err());
++        assert_eq!(m.save(), saved);
++        post_ready(&mut m, &mut h, 0);
++        let checkpoint = m.checkpoint().unwrap();
++        let mut without = c.clone();
++        without.post_control_source_sha256 = None;
++        assert!(
++            BankedCalibration::new(without)
++                .unwrap()
++                .restore_checkpoint(&checkpoint)
++                .is_err()
++        );
++        let mut other = c;
++        other.post_control_source_sha256 = Some("cd".repeat(32));
++        assert!(
++            BankedCalibration::new(other)
++                .unwrap()
++                .restore_checkpoint(&checkpoint)
++                .is_err()
++        );
++    }
++
++    #[test]
++    fn post_control_pending_checkpoints_validate_all_four_actions_and_no_failed_restore_commits() {
++        let c = post_config();
++        let mut m = BankedCalibration::new(c.clone()).unwrap();
++        let mut h = TestHost::new();
++        post_ready(&mut m, &mut h, 0);
++        let baseline = m.checkpoint().unwrap();
++        let mut fresh = BankedCalibration::new(c).unwrap();
++        for n in 0..4 {
++            let (o, v) = POST_CONTROL[n];
++            write(&mut m, &mut h, q(0, o), v);
++            let pending = m.checkpoint().unwrap();
++            fresh.restore_checkpoint(&pending).unwrap();
++            assert_eq!(fresh.save(), m.save());
++            for bad in 0..15 {
++                let mut state: State = pending.decode(NAME).unwrap();
++                match bad {
++                    0 => state.units[0].stage = Stage::PostControl(0),
++                    1 => state.units[0].stage = Stage::PostControl(8),
++                    2 => state.units[0].stage = Stage::PostControl(usize::MAX),
++                    3 => state.units[0].pending = None,
++                    4 => state.units[0].pending.as_mut().unwrap().action = Action::Pll,
++                    5 => state.units[0].pending.as_mut().unwrap().due += 1,
++                    6 => state.units[0].pending.as_mut().unwrap().token = 0,
++                    7 => state.units[0].pending.as_mut().unwrap().token = 1,
++                    8 => state.units[0].pending.as_mut().unwrap().token = state.generation + 1,
++                    9 => state.generation += 1,
++                    10 => state.identity.post_control_source_sha256 = None,
++                    11 => state.identity.post_control_source_sha256 = Some("00".repeat(32)),
++                    12 => state.units[0].stage = Stage::PostControlDone,
++                    13 => {
++                        state.units[0].primary.insert(0x444c, 1234);
++                    }
++                    _ => {
++                        state.units[0].paired.insert(0x7c50, 5);
++                    }
++                }
++                let before = fresh.save();
++                assert!(
++                    fresh
++                        .restore_checkpoint(&Checkpoint::encode(NAME, &state).unwrap())
++                        .is_err(),
++                    "action {n} bad {bad}"
++                );
++                assert_eq!(fresh.save(), before);
++            }
++            let token = m.state.units[0].pending.as_ref().unwrap().token;
++            fresh.restore_checkpoint(&baseline).unwrap();
++            let saved = fresh.save();
++            h.now += 8;
++            fresh.event(&mut h.cx(), token);
++            assert_eq!(fresh.save(), saved);
++            let now = h.now;
++            advance(&mut m, &mut h, now);
++            m.validate_checkpoint(&m.checkpoint().unwrap()).unwrap();
++        }
++        let mut unknown = serde_json::to_value(&m.state).unwrap();
++        unknown["identity"]["unknown"] = true.into();
++        assert!(serde_json::from_value::<State>(unknown).is_err());
++    }
++
++    #[test]
++    fn post_control_tokens_are_per_unit_and_overflow_never_mutates_the_request() {
++        let c = post_config();
++        let mut m = BankedCalibration::new(c.clone()).unwrap();
++        let mut h = TestHost::new();
++        for unit in 0..2 {
++            post_ready(&mut m, &mut h, unit);
++        }
++        for unit in 0..2 {
++            write(&mut m, &mut h, q(unit, 0x7c50), 1);
++        }
++        let pending = m.checkpoint().unwrap();
++        let mut state: State = pending.decode(NAME).unwrap();
++        state.units[1].pending.as_mut().unwrap().token =
++            state.units[0].pending.as_ref().unwrap().token;
++        let before = m.save();
++        assert!(
++            m.restore_checkpoint(&Checkpoint::encode(NAME, &state).unwrap())
++                .is_err()
++        );
++        assert_eq!(m.save(), before);
++        for which in 0..2 {
++            let mut m = BankedCalibration::new(c.clone()).unwrap();
++            let mut h = TestHost::new();
++            post_ready(&mut m, &mut h, 0);
++            if which == 0 {
++                h.now = u64::MAX - 7;
++            } else {
++                m.state.generation = u64::MAX;
++            }
++            refused(&mut m, &mut h, q(0, 0x7c50), 1);
++            assert!(m.state.units[0].pending.is_none());
++        }
++    }
++
++    fn post_mode2_config() -> Config {
++        let mut c = post_config();
++        c.mode2 = mode2_config().mode2;
++        c.post_mode2_source_sha256 = Some("12ab".repeat(16));
++        c
++    }
++    fn post_complete(m: &mut BankedCalibration, h: &mut TestHost, unit: usize) {
++        post_ready(m, h, unit);
++        for (o, v) in POST_CONTROL {
++            write(m, h, q(unit, o), v);
++            if m.state.units[unit].pending.is_some() {
++                let at = h.now + 8;
++                advance(m, h, at);
++            }
++        }
++        assert_eq!(m.state.units[unit].stage, Stage::PostControlDone);
++    }
++    fn post_mode2_prefix(
++        m: &mut BankedCalibration,
++        h: &mut TestHost,
++        unit: usize,
++        start: usize,
++        end: usize,
++    ) {
++        let script = m.config.mode2.as_ref().unwrap().scripts[unit].clone();
++        for (a, v) in script[start..end].to_vec() {
++            write(m, h, a.into(), v);
++            m.validate_checkpoint(&m.checkpoint().unwrap()).unwrap();
++        }
++    }
++
++    #[test]
++    fn post_mode2_all_units_overlay_exact_tables_and_only_clear_5384_after_eight_ticks() {
++        let c = post_mode2_config();
++        let mut m = BankedCalibration::new(c.clone()).unwrap();
++        let mut h = TestHost::new();
++        for unit in 0..4 {
++            post_complete(&mut m, &mut h, unit);
++            let baseline = m.state.units.clone();
++            let generation = m.state.generation;
++            let script = m.config.mode2.as_ref().unwrap().scripts[unit].clone();
++            for (n, (a, v)) in script.iter().copied().enumerate() {
++                refused(&mut m, &mut h, p(unit, a & 0xffff), v);
++                refused(&mut m, &mut h, a.into(), v ^ 1);
++                write(&mut m, &mut h, a.into(), v);
++                assert_eq!(m.state.units[unit].primary, baseline[unit].primary);
++                for i in 0..4 {
++                    if i != unit {
++                        assert_eq!(m.state.units[i], baseline[i]);
++                    }
++                }
++                m.validate_checkpoint(&m.checkpoint().unwrap()).unwrap();
++                if n < 70 {
++                    assert_eq!(m.state.units[unit].stage, Stage::PostMode2(n + 1));
++                    assert_eq!(m.state.generation, generation);
++                }
++                let saved = m.checkpoint().unwrap();
++                let mut fresh = BankedCalibration::new(c.clone()).unwrap();
++                fresh.restore_checkpoint(&saved).unwrap();
++                assert_eq!(fresh.save(), m.save());
++            }
++            let pending = m.state.units[unit].pending.clone().unwrap();
++            assert_eq!(pending.action, Action::PostMode2);
++            assert_eq!(pending.due, h.now + 8);
++            write(&mut m, &mut h, q(unit, 0x5384), 1);
++            assert_eq!(m.state.generation, generation + 1);
++            refused(&mut m, &mut h, q(unit, 0x7080), 0x100);
++            let before = m.save();
++            m.event(&mut h.cx(), pending.token + 100);
++            assert_eq!(m.save(), before);
++            let at = h.now + 7;
++            advance(&mut m, &mut h, at);
++            assert_eq!(m.save(), before);
++            let old = m.state.units[unit].clone();
++            let at = h.now + 1;
++            advance(&mut m, &mut h, at);
++            let mut expected = old;
++            expected.paired.insert(0x5384, 0);
++            expected.pending = None;
++            expected.stage = Stage::PostMode2Done;
++            assert_eq!(m.state.units[unit], expected);
++            assert_eq!(
++                m.state.units[unit].paired[&0x7090],
++                baseline[unit].paired[&0x7090]
++            );
++            let done = m.save();
++            m.event(&mut h.cx(), pending.token);
++            assert_eq!(m.save(), done);
++            let mut fresh = BankedCalibration::new(c.clone()).unwrap();
++            fresh.restore_checkpoint(&m.checkpoint().unwrap()).unwrap();
++            assert_eq!(fresh.save(), m.save());
++            for (a, v) in [
++                (q(unit, 0x5000), 0x01004100),
++                (q(unit, 0x5384), 1),
++                (q(unit, 0x7114), 0),
++                (p(unit, 0x2000), 0xb00),
++            ] {
++                refused(&mut m, &mut h, a, v);
++            }
++        }
++        assert_eq!(m.state.generation, 55);
++    }
++
++    #[test]
++    fn post_mode2_none_dependencies_identity_and_unconfigured_target_remain_strict() {
++        let c = post_mode2_config();
++        let mut without = c.clone();
++        without.post_mode2_source_sha256 = None;
++        let mut old = BankedCalibration::new(without.clone()).unwrap();
++        let mut h = TestHost::new();
++        post_complete(&mut old, &mut h, 0);
++        assert!(
++            old.save()["identity"]
++                .get("post_mode2_source_sha256")
++                .is_none()
++        );
++        refused(&mut old, &mut h, q(0, 0x5000), 0x01004100);
++        let mut m = BankedCalibration::new(c.clone()).unwrap();
++        let before = m.save();
++        assert!(m.restore_checkpoint(&old.checkpoint().unwrap()).is_err());
++        assert_eq!(m.save(), before);
++        for bad in 0..9 {
++            let mut c = c.clone();
++            match bad {
++                0 => c.reprogram = None,
++                1 => c.post_control_source_sha256 = None,
++                2 => c.mode2 = None,
++                3 => c.latency_ticks = 9,
++                4 => c.post_mode2_source_sha256 = Some(String::new()),
++                5 => c.post_mode2_source_sha256 = Some("a".repeat(63)),
++                6 => c.post_mode2_source_sha256 = Some("a".repeat(65)),
++                7 => c.post_mode2_source_sha256 = Some("AB".repeat(32)),
++                _ => c.post_mode2_source_sha256 = Some("gg".repeat(32)),
++            }
++            assert!(BankedCalibration::new(c).is_err(), "configuration {bad}");
++        }
++        post_complete(&mut m, &mut h, 0);
++        post_mode2_prefix(&mut m, &mut h, 0, 0, 1);
++        let saved = m.checkpoint().unwrap();
++        assert!(
++            BankedCalibration::new(without)
++                .unwrap()
++                .restore_checkpoint(&saved)
++                .is_err()
++        );
++        let mut other = c.clone();
++        other.post_mode2_source_sha256 = Some("cd".repeat(32));
++        assert!(
++            BankedCalibration::new(other)
++                .unwrap()
++                .restore_checkpoint(&saved)
++                .is_err()
++        );
++        let mut other = c.clone();
++        let mode2 = other.mode2.as_mut().unwrap();
++        mode2.scripts[0][23].1 ^= 1;
++        mode2.source_sha256 = mode2_hash(mode2);
++        assert!(
++            BankedCalibration::new(other)
++                .unwrap()
++                .restore_checkpoint(&saved)
++                .is_err()
++        );
++        let mut restricted = c;
++        let r = restricted.reprogram.as_mut().unwrap();
++        r.cached[1] = None;
++        r.input_sha256 = r.hash();
++        let mut no_target = BankedCalibration::new(restricted).unwrap();
++        let before = no_target.save();
++        assert!(no_target.restore_checkpoint(&saved).is_err());
++        assert_eq!(no_target.save(), before);
++        let expected_error = no_target.expected_unit(1, Stage::PostMode2(1));
++        assert!(expected_error.is_err());
++        refused(&mut no_target, &mut h, q(1, 0x5000), 0x01004100);
++    }
++
++    #[test]
++    fn post_mode2_checkpoint_prefix_pending_history_and_malformed_restore_are_atomic() {
++        let c = post_mode2_config();
++        let mut m = BankedCalibration::new(c.clone()).unwrap();
++        let mut h = TestHost::new();
++        post_complete(&mut m, &mut h, 0);
++        let post = m.checkpoint().unwrap();
++        post_mode2_prefix(&mut m, &mut h, 0, 0, 70);
++        let prefix = m.checkpoint().unwrap();
++        write(&mut m, &mut h, q(0, 0x5384), 1);
++        let pending = m.checkpoint().unwrap();
++        let mut fresh = BankedCalibration::new(c.clone()).unwrap();
++        fresh.restore_checkpoint(&prefix).unwrap();
++        assert_eq!(
++            fresh.save(),
++            prefix
++                .decode::<State>(NAME)
++                .map(|s| serde_json::to_value(s).unwrap())
++                .unwrap()
++        );
++        fresh.restore_checkpoint(&pending).unwrap();
++        assert_eq!(fresh.save(), m.save());
++        for bad in 0..19 {
++            let mut state: State = pending.decode(NAME).unwrap();
++            match bad {
++                0 => state.units[0].stage = Stage::PostMode2(0),
++                1 => state.units[0].stage = Stage::PostMode2(71),
++                2 => state.units[0].stage = Stage::PostMode2(usize::MAX),
++                3 => state.units[0].stage = Stage::Mode2(70),
++                4 => state.units[0].stage = Stage::PostMode2Done,
++                5 => state.units[0].pending = None,
++                6 => state.units[0].pending.as_mut().unwrap().action = Action::Mode2,
++                7 => state.units[0].pending.as_mut().unwrap().token = 0,
++                8 => state.units[0].pending.as_mut().unwrap().token = 1,
++                9 => state.units[0].pending.as_mut().unwrap().token = state.generation + 1,
++                10 => state.units[0].pending.as_mut().unwrap().due += 1,
++                11 => state.generation -= 1,
++                12 => state.generation += 1,
++                13 => state.identity.post_mode2_source_sha256 = None,
++                14 => {
++                    state.units[0].paired.insert(0x5384, 0);
++                }
++                15 => {
++                    state.units[0].primary.insert(0x4660, 0);
++                }
++                16 => {
++                    state.units[0].paired.insert(0x7c50, 1);
++                }
++                17 => {
++                    state.units[0].paired.insert(0x7090, 1);
++                }
++                _ => state.units.swap(0, 1),
++            }
++            let before = fresh.save();
++            assert!(
++                fresh
++                    .restore_checkpoint(&Checkpoint::encode(NAME, &state).unwrap())
++                    .is_err(),
++                "state {bad}"
++            );
++            assert_eq!(fresh.save(), before);
++        }
++        let mut unknown = serde_json::to_value(&m.state).unwrap();
++        unknown["identity"]["unknown"] = 0.into();
++        assert!(serde_json::from_value::<State>(unknown).is_err());
++        let token = m.state.units[0].pending.as_ref().unwrap().token;
++        fresh.restore_checkpoint(&post).unwrap();
++        let before = fresh.save();
++        h.now += 8;
++        fresh.event(&mut h.cx(), token);
++        assert_eq!(fresh.save(), before);
++        let at = h.now;
++        advance(&mut m, &mut h, at);
++        fresh.restore_checkpoint(&m.checkpoint().unwrap()).unwrap();
++        assert_eq!(fresh.save(), m.save());
++    }
++
++    #[test]
++    fn post_mode2_cross_unit_tokens_and_last_command_overflow_do_not_commit() {
++        let c = post_mode2_config();
++        let mut m = BankedCalibration::new(c.clone()).unwrap();
++        let mut h = TestHost::new();
++        for unit in 0..2 {
++            post_complete(&mut m, &mut h, unit);
++            post_mode2_prefix(&mut m, &mut h, unit, 0, 70);
++        }
++        for unit in 0..2 {
++            write(&mut m, &mut h, q(unit, 0x5384), 1);
++        }
++        let first = m.state.units[0].pending.clone().unwrap();
++        let second = m.state.units[1].pending.clone().unwrap();
++        assert_ne!(first.token, second.token);
++        let mut bad = m.state.clone();
++        bad.units[1].pending.as_mut().unwrap().token = first.token;
++        let before = m.save();
++        assert!(
++            m.restore_checkpoint(&Checkpoint::encode(NAME, &bad).unwrap())
++                .is_err()
++        );
++        assert_eq!(m.save(), before);
++        h.now = first.due;
++        m.event(&mut h.cx(), first.token);
++        assert_eq!(m.state.units[0].stage, Stage::PostMode2Done);
++        assert_eq!(m.state.units[1].stage, Stage::Pending(Action::PostMode2));
++        m.event(&mut h.cx(), second.token);
++        assert_eq!(m.state.units[1].stage, Stage::PostMode2Done);
++        m.validate_checkpoint(&m.checkpoint().unwrap()).unwrap();
++        for which in 0..2 {
++            let mut m = BankedCalibration::new(c.clone()).unwrap();
++            let mut h = TestHost::new();
++            post_complete(&mut m, &mut h, 0);
++            post_mode2_prefix(&mut m, &mut h, 0, 0, 70);
++            if which == 0 {
++                h.now = u64::MAX - 7;
++            } else {
++                m.state.generation = u64::MAX;
++            }
++            refused(&mut m, &mut h, q(0, 0x5384), 1);
++            assert!(m.state.units[0].pending.is_none());
++            assert_eq!(m.state.units[0].paired[&0x5384], 0);
++        }
++    }
++
++    fn selector1_config() -> Config {
++        let mut c = post_mode2_config();
++        c.selector1_source_sha256 = Some("ab12".repeat(16));
++        c
++    }
++    fn selector1_base(m: &mut BankedCalibration, h: &mut TestHost, unit: usize, from_post: bool) {
++        if from_post {
++            post_complete(m, h, unit);
++            post_mode2_prefix(m, h, unit, 0, 71);
++        } else {
++            if m.state.units[unit].stage != Stage::Complete {
++                cold_complete(m, h, unit);
++            }
++            mode5_done(m, h, unit);
++            mode2_prefix(m, h, unit, 0, 71);
++        }
++        let at = h.now + 8;
++        advance(m, h, at);
++        assert_eq!(
++            m.state.units[unit].stage,
++            if from_post {
++                Stage::PostMode2Done
++            } else {
++                Stage::Mode2Done
++            }
++        );
++    }
++
++    #[test]
++    fn selector1_both_origins_keep_ordinary_and_preinitialized_histories_and_exact_maps() {
++        for from_post in [false, true] {
++            for preinit in [false, true] {
++                let mut c = selector1_config();
++                c.unit0_preinitialized = preinit;
++                if !from_post {
++                    let r = c.reprogram.as_mut().unwrap();
++                    r.cached[0] = None;
++                    r.input_sha256 = r.hash();
++                }
++                let mut m = BankedCalibration::new(c.clone()).unwrap();
++                let mut h = TestHost::new();
++                selector1_base(&mut m, &mut h, 0, from_post);
++                let baseline = m.state.units.clone();
++                let before_generation = m.state.generation;
++                let expected_base = match (from_post, preinit) {
++                    (false, false) => 7,
++                    (false, true) => 2,
++                    (true, false) => 15,
++                    (true, true) => 10,
++                };
++                assert_eq!(before_generation, expected_base);
++                refused(&mut m, &mut h, q(0, 0x5038), 0x01004100);
++                for (n, (o, v)) in SELECTOR1.into_iter().enumerate() {
++                    refused(&mut m, &mut h, p(0, o), v);
++                    refused(&mut m, &mut h, q(0, o), v ^ 1);
++                    write(&mut m, &mut h, q(0, o), v);
++                    assert_eq!(m.state.units[0].primary, baseline[0].primary);
++                    for i in 1..4 {
++                        assert_eq!(m.state.units[i], baseline[i]);
++                    }
++                    m.validate_checkpoint(&m.checkpoint().unwrap()).unwrap();
++                    if n < 2 {
++                        assert_eq!(m.state.units[0].stage, Stage::Selector1(n + 1, from_post));
++                        assert_eq!(m.state.generation, before_generation);
++                        refused(&mut m, &mut h, q(0, o), v);
++                    }
++                    let mut fresh = BankedCalibration::new(c.clone()).unwrap();
++                    fresh.restore_checkpoint(&m.checkpoint().unwrap()).unwrap();
++                    assert_eq!(fresh.save(), m.save());
++                }
++                let pending = m.state.units[0].pending.clone().unwrap();
++                assert_eq!(pending.action, Action::Selector1(from_post));
++                assert_eq!(pending.due, h.now + 8);
++                write(&mut m, &mut h, q(0, 0x5384), 1);
++                assert_eq!(m.state.generation, before_generation + 1);
++                refused(&mut m, &mut h, q(0, 0x5038), 0x03204020);
++                let before = m.save();
++                m.event(&mut h.cx(), pending.token + 100);
++                assert_eq!(m.save(), before);
++                let at = h.now + 7;
++                advance(&mut m, &mut h, at);
++                assert_eq!(m.save(), before);
++                let old = m.state.units[0].clone();
++                let at = h.now + 1;
++                advance(&mut m, &mut h, at);
++                let mut expected = old;
++                expected.paired.insert(0x5384, 0);
++                expected.pending = None;
++                expected.stage = Stage::Selector1Done(from_post);
++                assert_eq!(m.state.units[0], expected);
++                assert_eq!(
++                    m.state.units[0].paired[&0x7090],
++                    baseline[0].paired[&0x7090]
++                );
++                let done = m.save();
++                m.event(&mut h.cx(), pending.token);
++                assert_eq!(m.save(), done);
++                let mut fresh = BankedCalibration::new(c).unwrap();
++                fresh.restore_checkpoint(&m.checkpoint().unwrap()).unwrap();
++                assert_eq!(fresh.save(), m.save());
++                for (o, v) in [
++                    (0x5038, 0x03204020),
++                    (0x5038, 0x01004100),
++                    (0x5438, 0x81),
++                    (0x5384, 1),
++                    (0x7114, 0),
++                ] {
++                    refused(&mut m, &mut h, q(0, o), v);
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn selector1_none_identity_dependencies_and_cold_without_reprogram_target_remain_strict() {
++        for origin in [false, true] {
++            let mut c = selector1_config();
++            c.selector1_source_sha256 = None;
++            let mut m = BankedCalibration::new(c.clone()).unwrap();
++            let mut h = TestHost::new();
++            selector1_base(&mut m, &mut h, 0, origin);
++            assert!(
++                m.save()["identity"]
++                    .get("selector1_source_sha256")
++                    .is_none()
++            );
++            refused(&mut m, &mut h, q(0, 0x5038), 0x03204020);
++            c.selector1_source_sha256 = Some("ab12".repeat(16));
++            let mut enabled = BankedCalibration::new(c.clone()).unwrap();
++            let before = enabled.save();
++            assert!(
++                enabled
++                    .restore_checkpoint(&m.checkpoint().unwrap())
++                    .is_err()
++            );
++            assert_eq!(enabled.save(), before);
++            selector1_base(&mut enabled, &mut h, 0, origin);
++            write(&mut enabled, &mut h, q(0, 0x5038), 0x03204020);
++            let saved = enabled.checkpoint().unwrap();
++            let before = m.save();
++            assert!(m.restore_checkpoint(&saved).is_err());
++            assert_eq!(m.save(), before);
++            c.selector1_source_sha256 = Some("cd".repeat(32));
++            assert!(
++                BankedCalibration::new(c)
++                    .unwrap()
++                    .restore_checkpoint(&saved)
++                    .is_err()
++            );
++        }
++        for bad in 0..7 {
++            let mut c = selector1_config();
++            match bad {
++                0 => c.mode2 = None,
++                1 => c.latency_ticks = 9,
++                2 => c.selector1_source_sha256 = Some(String::new()),
++                3 => c.selector1_source_sha256 = Some("a".repeat(63)),
++                4 => c.selector1_source_sha256 = Some("a".repeat(65)),
++                5 => c.selector1_source_sha256 = Some("AB".repeat(32)),
++                _ => c.selector1_source_sha256 = Some("gg".repeat(32)),
++            }
++            assert!(BankedCalibration::new(c).is_err(), "config {bad}");
++        }
++        // This cold-origin configuration intentionally has no reprogram/post path at all.
++        let mut c = mode2_config();
++        c.selector1_source_sha256 = Some("ab12".repeat(16));
++        let mut m = BankedCalibration::new(c).unwrap();
++        let mut h = TestHost::new();
++        selector1_base(&mut m, &mut h, 0, false);
++        write(&mut m, &mut h, q(0, 0x5038), 0x03204020);
++        m.validate_checkpoint(&m.checkpoint().unwrap()).unwrap();
++        assert!(m.expected_unit(0, Stage::Selector1(1, true)).is_err());
++    }
++
++    #[test]
++    fn selector1_checkpoint_origins_arity_maps_and_histories_validate_before_commit() {
++        for origin in [false, true] {
++            let c = selector1_config();
++            let mut m = BankedCalibration::new(c.clone()).unwrap();
++            let mut h = TestHost::new();
++            selector1_base(&mut m, &mut h, 0, origin);
++            let base = m.checkpoint().unwrap();
++            write(&mut m, &mut h, q(0, 0x5038), 0x03204020);
++            let prefix = m.checkpoint().unwrap();
++            write(&mut m, &mut h, q(0, 0x5438), 0x83);
++            write(&mut m, &mut h, q(0, 0x5384), 1);
++            let pending = m.checkpoint().unwrap();
++            let mut fresh = BankedCalibration::new(c).unwrap();
++            fresh.restore_checkpoint(&prefix).unwrap();
++            fresh.restore_checkpoint(&pending).unwrap();
++            assert_eq!(fresh.save(), m.save());
++            for bad in 0..19 {
++                let mut state: State = pending.decode(NAME).unwrap();
++                match bad {
++                    0 => state.units[0].stage = Stage::Selector1(0, origin),
++                    1 => state.units[0].stage = Stage::Selector1(3, origin),
++                    2 => state.units[0].stage = Stage::Selector1(usize::MAX, origin),
++                    3 => state.units[0].stage = Stage::Pending(Action::Selector1(!origin)),
++                    4 => {
++                        state.units[0].pending.as_mut().unwrap().action = Action::Selector1(!origin)
++                    }
++                    5 => {
++                        state.units[0].stage = Stage::Pending(Action::Selector1(!origin));
++                        state.units[0].pending.as_mut().unwrap().action =
++                            Action::Selector1(!origin);
++                    }
++                    6 => state.units[0].pending.as_mut().unwrap().action = Action::Mode2,
++                    7 => state.units[0].pending = None,
++                    8 => state.units[0].pending.as_mut().unwrap().token = 0,
++                    9 => state.units[0].pending.as_mut().unwrap().token = 1,
++                    10 => state.units[0].pending.as_mut().unwrap().token = state.generation + 1,
++                    11 => state.units[0].pending.as_mut().unwrap().due += 1,
++                    12 => state.generation -= 1,
++                    13 => state.generation += 1,
++                    14 => state.identity.selector1_source_sha256 = None,
++                    15 => {
++                        state.units[0].paired.insert(0x5038, 0x01004100);
++                    }
++                    16 => {
++                        state.units[0].primary.insert(0x4660, 0);
++                    }
++                    17 => state.units[0].stage = Stage::Selector1Done(origin),
++                    _ => state.units.swap(0, 1),
++                }
++                let before = fresh.save();
++                assert!(
++                    fresh
++                        .restore_checkpoint(&Checkpoint::encode(NAME, &state).unwrap())
++                        .is_err(),
++                    "origin {origin} bad {bad}"
++                );
++                assert_eq!(fresh.save(), before);
++            }
++            for bad in 0..7 {
++                let mut value = serde_json::to_value(&m.state).unwrap();
++                value["units"][0]["stage"] = match bad {
++                    0 => serde_json::json!({"Selector1":[1,origin,0]}),
++                    1 => serde_json::json!({"Selector1":[1]}),
++                    2 => serde_json::json!({"Selector1":[1,0]}),
++                    3 => serde_json::json!({"Selector1Done":{"from_post":origin,"unknown":1}}),
++                    4 => serde_json::json!({"Pending":{"Selector1":{"from_post":origin}}}),
++                    5 => serde_json::json!({"Pending":{"Selector1":0}}),
++                    _ => serde_json::json!({"Selector1":[1,"false"]}),
++                };
++                let before = fresh.save();
++                assert!(
++                    fresh
++                        .restore_checkpoint(&Checkpoint::encode(NAME, &value).unwrap())
++                        .is_err(),
++                    "arity {bad}"
++                );
++                assert_eq!(fresh.save(), before);
++            }
++            let token = m.state.units[0].pending.as_ref().unwrap().token;
++            fresh.restore_checkpoint(&base).unwrap();
++            let before = fresh.save();
++            h.now += 8;
++            fresh.event(&mut h.cx(), token);
++            assert_eq!(fresh.save(), before);
++            let at = h.now;
++            advance(&mut m, &mut h, at);
++            fresh.restore_checkpoint(&m.checkpoint().unwrap()).unwrap();
++            assert_eq!(fresh.save(), m.save());
++        }
++    }
++
++    #[test]
++    fn selector1_mixed_origin_tokens_and_last_write_overflow_never_lose_history() {
++        let c = selector1_config();
++        let mut m = BankedCalibration::new(c.clone()).unwrap();
++        let mut h = TestHost::new();
++        selector1_base(&mut m, &mut h, 0, false);
++        selector1_base(&mut m, &mut h, 1, true);
++        assert_eq!(m.state.generation, 17);
++        for unit in 0..2 {
++            for (o, v) in SELECTOR1 {
++                write(&mut m, &mut h, q(unit, o), v);
++            }
++        }
++        let a = m.state.units[0].pending.clone().unwrap();
++        let b = m.state.units[1].pending.clone().unwrap();
++        assert_eq!(a.action, Action::Selector1(false));
++        assert_eq!(b.action, Action::Selector1(true));
++        assert_ne!(a.token, b.token);
++        assert_eq!(m.state.generation, 19);
++        let pending = m.checkpoint().unwrap();
++        let mut fresh = BankedCalibration::new(c.clone()).unwrap();
++        fresh.restore_checkpoint(&pending).unwrap();
++        assert_eq!(fresh.save(), m.save());
++        let mut bad: State = pending.decode(NAME).unwrap();
++        bad.units[1].pending.as_mut().unwrap().token = a.token;
++        let before = m.save();
++        assert!(
++            m.restore_checkpoint(&Checkpoint::encode(NAME, &bad).unwrap())
++                .is_err()
++        );
++        assert_eq!(m.save(), before);
++        h.now = a.due;
++        m.event(&mut h.cx(), a.token);
++        assert_eq!(m.state.units[0].stage, Stage::Selector1Done(false));
++        assert_eq!(
++            m.state.units[1].stage,
++            Stage::Pending(Action::Selector1(true))
++        );
++        m.event(&mut h.cx(), b.token);
++        assert_eq!(m.state.units[1].stage, Stage::Selector1Done(true));
++        m.validate_checkpoint(&m.checkpoint().unwrap()).unwrap();
++        for origin in [false, true] {
++            for generation_overflow in [false, true] {
++                let mut m = BankedCalibration::new(c.clone()).unwrap();
++                let mut h = TestHost::new();
++                selector1_base(&mut m, &mut h, 0, origin);
++                for (o, v) in SELECTOR1[..2].to_vec() {
++                    write(&mut m, &mut h, q(0, o), v);
++                }
++                if generation_overflow {
++                    m.state.generation = u64::MAX;
++                } else {
++                    h.now = u64::MAX - 7;
++                }
++                refused(&mut m, &mut h, q(0, 0x5384), 1);
++                assert!(m.state.units[0].pending.is_none());
++                assert_eq!(m.state.units[0].paired[&0x5384], 0);
++            }
++        }
++    }
++}

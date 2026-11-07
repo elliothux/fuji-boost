@@ -1,0 +1,15 @@
+[package]
+name = "fuji-capture"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+fujimod-usb = { path = "../../references/fujimod/crates/usb" }
+futures-lite = "2"
+futures-timer = "3"
+nusb = { version = "0.2.9", features = ["smol"] }
+serde_json = "1"
+sha2 = "0.10"

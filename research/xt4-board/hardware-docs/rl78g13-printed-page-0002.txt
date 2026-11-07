@@ -1,0 +1,48 @@
+ 
+RL78/G13  CHAPTER  1   OUTLINE 
+R01UH0146EJ0380  Rev.3.80   2  
+Oct 31, 2024 
+DMA (Direct Memory Access) controller 
+● 2/4 channels 
+● Number of clocks during transfer between 8/16-bit SFR and internal RAM: 2 clocks 
+ 
+Multiplier and divider/multiply-accumulator 
+● 16 bits × 16 bits = 32 bits (Unsigned or signed) 
+● 32 bits ÷ 32 bits = 32 bits (Unsigned) 
+● 16 bits × 16 bits + 32 bits = 32 bits (Unsigned or signed) 
+ 
+Serial interface 
+● Simplified SPI (CSI 
+Note 1): 2 to 8 channels 
+● UART/UART (LIN-bus supported): 2 to 4 channels 
+● I 2C/Simplified I2C communication: 3 to 10 channels 
+ 
+Timer 
+● 16-bit timer: 8 to 16 channels 
+● 12-bit interval timer: 1 channel 
+● Real-time clock: 1 channel (calendar for 99 year s, alarm function, and clock correction function) 
+● Watchdog timer: 1 channel (operable with the dedicated low-speed on-chip oscillator) 
+ 
+A/D converter 
+● 8/10-bit resolution A/D converter (V DD = 1.6 to 5.5 V) 
+● Analog input: 6 to 26 channels 
+● Internal reference voltage (1.45 V) and temperature sensor Note 2 
+ 
+I/O port 
+● I/O port: 16 to 120 (N-ch open drain I/O [wit hstand voltage of 6 V]: 0 to 4,  
+ N-ch open drain I/O [V DD withstand voltage Note 3/EVDD withstand voltage Note 4]: 5 to 25) 
+● Can be set to N-ch open drain, TTL input buffer, and on-chip pull-up resistor 
+● Different potential interface: Can connect to a 1.8/2.5/3 V device 
+● On-chip key interrupt function 
+● On-chip clock output/buzzer output controller 
+ 
+Others 
+● On-chip BCD (binary-coded decimal) correction circuit 
+ 
+Notes 1. Although the CSI function is generally called SPI, it is also called CSI in this product, so it is referred to as such in this 
+manual. 
+ 2.  Can be selected only in HS (high-speed main) mode 
+ 3.  Products with 20 to 52 pins 
+ 4 . Products with 64 to 128 pins 
+ 
+Remark The functions mounted depend on the product.  See 1.6  Outline of Functions. 

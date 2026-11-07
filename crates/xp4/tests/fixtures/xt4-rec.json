@@ -1,0 +1,64 @@
+{
+  "firmwareSha256": "853d273b5603d3a2b93493f0ebd6a762b0b4b6bdc70317777775ae5f8ed93bc5",
+  "graySha256": "7d55dde0088cfaab31f4dfb97f6a97a8aa58b10c0f28258dae878a8fb41c5926",
+  "blankLiveViewSha256": "c21af92a69b535664ae18b1fbfdfcc7bf0c1a48820eeaf297837b7add03c962e",
+  "startupRecSha256": "e4bdfba3a57bf0a911e65436df3b7a63763feb2fd83ba1fd1eaa2049337c86e9",
+  "startupLiveViewSha256": "7f0d1b25ba60afd74aaa54887008fd1ca1ebc2c66dc338ce0d9514eba42b9774",
+  "startupExposureSha256": "b41eab322764b845e2131d124f4cb8a7708b69829b2b68d7e78ef032bf3f6dc1",
+  "preLiveRecSha256": "f2757c7a94e3315d43674be0b90b911b490010c7bca4be5dbb2eac7daac83372",
+  "recSha256": "0de74d2fa86611f65602e531ecf37a4c4230805a6ebd5685b49432feb3f8fc4e",
+  "measuredRecSha256": "ea51f8387704a1c08ad858cab4f4a44281404d7cbc45c879859c033c8c2a91a8",
+  "shutterSha256": "b0a0eccef844032fe6d291864e14b9ac4f14ae2ea3f0687fe75248be207f1643",
+  "menuSha256": "0beb243fa5c23b761471cbc5c23d1c0966db417cbd5025f825f7f46e204a17a0",
+  "menuDownSha256": "8a02d5ef253b81803546ac2b39cea00da5e4723540e0de9ca33e3e3ab84a1be9",
+  "frontDialSha256": "e8be3804a8dbc46cca1e11dbb5e98fb7afea2ca785fa5eb6344e249c818d979e",
+  "rearDialSha256": "d2d6cc000a57c3dbb90dbeaf9dda24882e96d20a9a961488be883d17090f315f",
+  "settledRecInstructions": 1742520606,
+  "wizard": [
+    {
+      "button": "up",
+      "instructions": 798020606,
+      "sha256": "98e541541ed5a4b5806a6c6973fe1d8f4cdc5c6786e82154adcac86d4619f355"
+    },
+    {
+      "button": "up",
+      "instructions": 818770606,
+      "sha256": "802eaa8783bab01041e5276d950a928a1981ddbe22cedec48b3ffc2f2ed62ac0"
+    },
+    {
+      "button": "up",
+      "instructions": 839770606,
+      "sha256": "41c8edb42515e6222feb617da6aca732769323820323606f3d0ed591485ffba3"
+    },
+    {
+      "button": "ok",
+      "instructions": 860520606,
+      "sha256": "94f17d87b4f88d08b7b4dee30fe1ce1a249546ea2f59f4dbe0801ac79c4a3378"
+    },
+    {
+      "button": "down",
+      "instructions": 880270606,
+      "sha256": "b0630e88a7786c2f672aeab1892b3f33be2bc470cb5149d7c99d80a05a92d006"
+    },
+    {
+      "button": "down",
+      "instructions": 894520606,
+      "sha256": "c9b53e43ea5e4042792ce2852a012537186ee77f5bf473cca82572971ac3aa89"
+    },
+    {
+      "button": "ok",
+      "instructions": 909270606,
+      "sha256": "6906e9a7eb9fbcc75af6c6a310b295a2572662da4029e9a0b7bcb82dd91a781b"
+    },
+    {
+      "button": "ok",
+      "instructions": 930270606,
+      "sha256": "7f9ca75b946bfd82a53b779afbea5f9c3571cc0e73f58b43f04d5c6fb5a942ac"
+    },
+    {
+      "button": "ok",
+      "instructions": 948770606,
+      "sha256": "c91f66ecb31176191555d04797802a0b73ba6f57aa6d71064c891d31e9e8679d"
+    }
+  ]
+}

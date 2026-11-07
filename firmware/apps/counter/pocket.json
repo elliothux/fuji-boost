@@ -1,0 +1,25 @@
+{
+  "$schema": "https://pocketjs.dev/schema/pocket-2.json",
+  "pocket": 2,
+  "id": "dev.fuji-boost.counter",
+  "name": "fuji-boost-counter",
+  "title": "fuji-boost: Counter",
+  "version": "0.1.0",
+  "engine": {
+    "capabilities": {
+      "requires": ["input.buttons", "text.glyphs.baked"],
+      "enhances": ["input.touch"]
+    }
+  },
+  "app": {
+    "entry": "firmware/apps/counter/main.tsx",
+    "output": "counter",
+    "framework": "solid",
+    "viewport": {
+      "fixed": {
+        "logical": [450, 300],
+        "presentation": "native"
+      }
+    }
+  }
+}

@@ -1,0 +1,20 @@
+[
+  {
+    "id": "xt4-212",
+    "model": "X-T4",
+    "version": "2.12",
+    "processor": "X-Processor 4",
+    "architecture": "ARM Cortex-A7",
+    "size": 51278280,
+    "sha256": "853d273b5603d3a2b93493f0ebd6a762b0b4b6bdc70317777775ae5f8ed93bc5"
+  },
+  {
+    "id": "x70-110",
+    "model": "X70",
+    "version": "1.10",
+    "processor": "EXR Processor II",
+    "architecture": "ARM Cortex-R5F",
+    "size": 53085736,
+    "sha256": "7dd5b358a66f38d1fc7dad899a77d35fe4e6ed0edd0ed1d04fbca512d5dc8fd6"
+  }
+]

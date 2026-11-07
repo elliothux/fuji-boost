@@ -1,0 +1,9 @@
+[build]
+target = "armv7a-none-eabihf"
+
+[unstable]
+build-std = ["core", "alloc", "compiler_builtins"]
+build-std-features = ["compiler-builtins-mem"]
+
+[target.armv7a-none-eabihf]
+rustflags = ["-C", "target-cpu=cortex-a7"]

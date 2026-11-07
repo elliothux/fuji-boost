@@ -1,0 +1,92 @@
+diff --git a/crates/emulator-xp4-io/src/rtc.rs b/crates/emulator-xp4-io/src/rtc.rs
+--- a/crates/emulator-xp4-io/src/rtc.rs
++++ b/crates/emulator-xp4-io/src/rtc.rs
+@@ -55,6 +55,10 @@
+     pub read_high: u8,
+     pub stage_low: u8,
+     pub stage_high: u8,
++    #[serde(default)]
++    pub staging_readback: bool,
++    #[serde(default)]
++    pub retained_control_echo: bool,
+     pub commit_value: u16,
+     pub valid_mask: u16,
+     pub retained_valid_mask: u16,
+@@ -154,6 +158,10 @@
+             Ok(self.counter.counter(tick)? as u16)
+         } else if register == c.read_high {
+             Ok((self.counter.counter(tick)? >> 16) as u16)
++        } else if c.staging_readback && register == c.stage_low {
++            Ok(self.staged as u16)
++        } else if c.staging_readback && register == c.stage_high {
++            Ok((self.staged >> 16) as u16)
+         } else {
+             Err("Staged RTC staging-register readback is not modeled".into())
+         }
+@@ -186,6 +194,20 @@
+     }
+     pub fn retained_control_value(&self) -> u16 {
+         self.config.valid_mask | self.config.retained_valid_mask
++    }
++    /// Explicit virtual echo only; no data commit, clock reload or IRQ effect.
++    pub fn allows_retained_echo(&self, value: u16, tick: u64) -> Result<bool, String> {
++        if !self.config.retained_control_echo
++            || !self.committed
++            || !self.counter.running
++            || value != self.retained_control_value()
++            || value != self.control_written
++        {
++            return Ok(false);
++        }
++        let elapsed = tick.checked_sub(self.counter.anchor)
++            .ok_or("Power RTC clock moved backwards")?;
++        Ok(elapsed >= self.config.strobe.clear_from_ticks)
+     }
+     pub fn commit_retained(&mut self, value: u16, tick: u64) -> Result<(), String> {
+         let elapsed = tick
+@@ -232,6 +254,8 @@
+             read_high: 102,
+             stage_low: 103,
+             stage_high: 104,
++            staging_readback: false,
++            retained_control_echo: false,
+             commit_value: 0x202,
+             valid_mask: 2,
+             retained_valid_mask: 1,
+@@ -245,6 +269,36 @@
+             ticks_per_second: 10,
+         }
+     }
++    #[test]
++    fn explicit_staging_readback_is_observational_and_independent_of_the_counter() {
++        let strict = StagedClock::new(config()).unwrap();
++        assert!(strict.read(103, 0).is_err());
++        assert!(strict.read(104, 0).is_err());
++        let mut cfg = config();
++        cfg.staging_readback = true;
++        let mut clock = StagedClock::new(cfg).unwrap();
++        assert_eq!(clock.read(103, 0).unwrap(), 0);
++        assert_eq!(clock.read(104, 0).unwrap(), 0);
++        clock.write(103, 0x5678, 1).unwrap();
++        assert_eq!(clock.read(103, 2).unwrap(), 0x5678);
++        assert_eq!(clock.read(104, 2).unwrap(), 0);
++        clock.write(104, 0x1234, 3).unwrap();
++        clock.write(100, 0x202, 10).unwrap();
++        let saved = serde_json::to_value(&clock).unwrap();
++        assert_eq!(clock.read(101, 30).unwrap(), 0x567a);
++        assert_eq!(clock.read(103, 30).unwrap(), 0x5678);
++        assert_eq!(clock.read(104, 30).unwrap(), 0x1234);
++        assert_eq!(serde_json::to_value(&clock).unwrap(), saved);
++        let mut resumed: StagedClock = serde_json::from_value(saved).unwrap();
++        resumed.validate_restore(&clock).unwrap();
++        assert!(resumed.validate_restore(&strict).is_err());
++        resumed.write(103, 0xabcd, 31).unwrap();
++        assert_eq!(resumed.read(103, 32).unwrap(), 0xabcd);
++        assert_eq!(resumed.read(104, 32).unwrap(), 0x1234);
++        assert_eq!(resumed.read(101, 32).unwrap(), 0x567a);
++        assert!(resumed.read(42, 32).is_err());
++    }
++
+     #[test]
+     fn staged_load_uses_the_shared_counter_and_refuses_unknown_control_semantics() {
+         let mut clock = StagedClock::new(config()).unwrap();

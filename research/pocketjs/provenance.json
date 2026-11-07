@@ -1,0 +1,7 @@
+{
+  "repository": "https://github.com/pocket-nexus/pocketjs",
+  "commit": "e27bff3e96df3c7b3c8263a34f2362b964df04fb",
+  "date": "2026-10-23",
+  "method": "Read-only source inspection; no build, installation, firmware patch or device execution",
+  "git_checkout": "partial clone, no checkout; selected source blobs saved under files/"
+}

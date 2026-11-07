@@ -1,0 +1,41 @@
+{
+  "date": "2026-10-28",
+  "scope": "public primary documents plus existing pinned source; no hardware operations",
+  "query_groups": [
+    {
+      "queries": ["\"FFF4A400\"", "\"FFF48700\"", "\"0xfff48700\" OR \"0xfff4a400\"", "\"FFF4 A400\" Fujitsu", "\"FFF4 8700\" Socionext"],
+      "outcome": "No matching XP4/FF4230 hardware document found. UUID and unrelated address-fragment results discarded."
+    },
+    {
+      "queries": ["\"FF4230\" \"PMIC\"", "\"FF4230\" \"Socionext\"", "\"Fujifilm X-T4\" \"power\" \"chip\"", "\"X-T4\" \"R5F\"", "\"Fujifilm\" \"R5F100EDA\" SPI"],
+      "outcome": "Photo-parts X-T4 original component table found. No FF4230 register manual or SPI1-to-MCU net mapping found."
+    },
+    {
+      "queries": ["\"Fujifilm\" \"SPI\" \"checksum\" \"power\"", "\"Fujifilm\" \"SPI\" \"0x7f00\"", "\"Fujifilm\" \"power controller\" \"checksum\"", "\"Fujifilm\" \"RL78\" firmware SPI"],
+      "outcome": "No exact camera power-peer register protocol source or real capture found. GFX lens-bus four-byte research rejected as a different endpoint."
+    },
+    {
+      "queries": ["\"X-T4\" teardown motherboard MAX77812", "\"X-T4 PCB\" \"photo-parts\"", "\"R5F100EDANA\" site:renesas.com/products", "site:renesas.com \"RL78/G13\" \"40-pin\" \"Serial array\""],
+      "outcome": "Exact PCB photo index and Renesas part/family documents located; image pixels and wiring were not identified."
+    },
+    {
+      "queries": ["site:analog.com MAX77812 I2C register SPI", "\"MAX77961\" \"I2C\" site:analog.com"],
+      "outcome": "Vendor manuals opened. MAX77812 four-byte single SPI format differs materially;MAX77961 is I2C/resistor controlled. Neither identifies the peer."
+    },
+    {
+      "queries": ["site:renesas.com \"RL78/G13\" \"48 KB\" \"3 KB\"", "site:renesas.com \"RL78/G13\" \"Figure 3-3\" \"0BFFFH\"", "site:renesas.com \"RL78/G13\" \"00000H\" \"00001H\"", "site:renesas.com \"RL78/G13\" \"000C0H\" \"000C3H\""],
+      "outcome": "Manufacturer capacity/vector/memory-map sources confirmed. Full hardware PDF fetched and selected pages independently extracted after web tool hit file-size limit."
+    },
+    {
+      "queries": ["\"Milbeaut\" \"fff4\" clock", "\"Milbeaut\" \"SPI\" \"clock\" \"selector\""],
+      "outcome": "Primary M10V kernel source inspected as a rejected equivalence candidate: different SoC identity/map; no valid import of semantics."
+    }
+  ],
+  "local_search": {
+    "fujimod_commit": "1de936e9b1ca738b04ad5132c727288ddd5eb2ae",
+    "roots": ["references/fujimod/catalog", "references/fujimod/crates", "references/fffw", "research/xt4-startup-frontier", "research/xt4-board/spi-frontier"],
+    "terms": ["fff4a400", "fff48700", "7f00", "checksum power", "power peer", "FF4230", "PMIC", "R5F100", "RL78"],
+    "outcome": "Existing protocol model and source-bound reports confirmed; catalog part remains generic and no new physical endpoint identity/semantics discovered. No broad negative claim outside these bounded trees."
+  },
+  "not_performed": ["camera USB/SPI access", "register writes or reads from hardware", "logic-analyzer capture", "board continuity measurement", "MCU firmware extraction", "Grok", "Docker", "builds", "application/core changes", "contacting researchers"]
+}

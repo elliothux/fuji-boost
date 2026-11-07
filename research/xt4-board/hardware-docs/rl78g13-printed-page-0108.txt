@@ -1,0 +1,111 @@
+ 
+RL78/G13  CHAPTER  3   CPU ARCHITECTURE 
+R01UH0146EJ0380  Rev.3.80   108  
+Oct 31, 2024 
+Figure 3-3.  Memory Map (R5F100xD, R5F101xD (x = 6 to 8, A to C, E to G, J, L)) 
+ 
+00FFFH
+01000H
+Data memory
+space
+Program
+memory
+space
+00000H
+EFFFFH
+F0000H
+F0FFFH
+F1000H
+FF300H
+FF2FFH
+FFEDFH
+FFEE0H
+FFEFFH
+FFF00H
+FFFFFH
+0BFFFH
+0C000H
+F07FFH
+F0800H
+00000H
+0007FH
+00080H
+000BFH
+000C0H
+000C3H
+000C4H
+0107FH
+01080H
+010BFH
+010C0H
+010C3H
+010C4H
+0BFFFH
+Vector table area
+128 bytes
+CALLT table area
+64 bytes
+Program area
+Option byte areaNote 3
+4 bytes
+Vector table area
+128 bytes
+CALLT table area
+64 bytes
+Option byte areaNote 3
+4 bytes
+Program area
+On-chip debug security
+ID setting areaNote 3
+10 bytes
+01FFFH
+Boot cluster 0Note 4
+Boot cluster 1
+010CDH
+010CEH
+On-chip debug security
+ID setting areaNote 3
+10 bytes
+000CDH
+000CEH
+Special function register (SFR)
+256 bytes
+General-purpose register
+32 bytes
+RAMNotes 1, 2
+3 KB
+Mirror
+40 KB
+Reserved
+Special function register (2nd SFR)
+2 KB
+Reserved
+Code flash memory
+48 KB
+Data flash memoryNote 5
+4 KB
+F1FFFH
+F2000H
+FC000H
+FBFFFH
+Reserved
+ 
+ 
+Notes 1.  Do not allocate the stack area, data buffers for use by the flash library, argum ents of library functions, 
+branch destinations in the processing of vectored interr upts, or destinations or sources for DMA transfer to 
+the area from FFE20H to FFEDFH when performing self-programming or rewriting of the data flash memory. 
+The RAM area used by the flash library starts at FF 300H. For the RAM areas used by the flash library, see 
+Self RAM list of Flash Self-Programming Library for RL78 Family (R20UT2944). 
+ 2.  Instructions can be executed from the RAM ar ea excluding the general-purpose register area. 
+ 3. When boot swap is not used:  Set the option bytes to 000C0H to 000C3H, and the on-chip debug security 
+IDs to 000C4H to 000CDH. 
+  When boot swap is used:  Set the option bytes to 000C0H to 000C3H and 010C0H to 010C3H, and the 
+on-chip debug security IDs to 000C4H to 000CDH and 010C4H to 010CDH. 
+ 4. Writing boot cluster 0 can be prohibited depending on the setting of security (see 25.7  Security Settings). 
+ 5. The areas are reserved in the R5F101xD. 
+ 
+Caution While RAM parity error resets are enabled (RPERDIS = 0), be sure to initialize RAM areas where data 
+access is to proceed and the RAM area + 10 bytes when instructions are fetched from RAM areas, 
+respectively. 
+ Reset signal generation sets RAM parity error resets to enabled (RPERDIS = 0). For details, see 
+22.3.3 RAM parity error detection function. 

@@ -1,0 +1,27 @@
+{
+  "scope": "Illustrative 640x480 surface, not measured or verified X-T4 framebuffer dimensions/format. Output write volume only, excludes texture reads, blending, copies, cache maintenance and firmware activity.",
+  "surfaces": [
+    {
+      "format": "RGB565",
+      "width": 640,
+      "height": 480,
+      "bytes_per_pixel": 2,
+      "single_buffer_bytes": 614400,
+      "single_buffer_MiB": 0.5859375,
+      "double_buffer_MiB": 1.171875,
+      "full_frame_output_MiB_per_second_at_30fps": 17.578125
+    },
+    {
+      "format": "ARGB32",
+      "width": 640,
+      "height": 480,
+      "bytes_per_pixel": 4,
+      "single_buffer_bytes": 1228800,
+      "single_buffer_MiB": 1.171875,
+      "double_buffer_MiB": 2.34375,
+      "full_frame_output_MiB_per_second_at_30fps": 35.15625
+    }
+  ],
+  "measured_XT4_available_heap": null,
+  "measured_XT4_CPU_headroom": null
+}

@@ -1,0 +1,1079 @@
+diff --git a/crates/emulator-xp4-io/src/checksum_power_serial.rs b/crates/emulator-xp4-io/src/checksum_power_serial.rs
+--- a/crates/emulator-xp4-io/src/checksum_power_serial.rs
++++ b/crates/emulator-xp4-io/src/checksum_power_serial.rs
+@@ -27,6 +27,26 @@
+     phase: u8,
+     frame: [u8; 4],
+     response: u16,
++    #[serde(default)]
++    initialization_commands: bool,
++    #[serde(default)]
++    commands: Vec<(u64, u16)>,
++    #[serde(default)]
++    inactive_countdown: bool,
++    #[serde(default)]
++    countdown_resets: Vec<u64>,
++    #[serde(default)]
++    latched_startup_cause: bool,
++    #[serde(default)]
++    status16_unknown: bool,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    word2_one_acks: Option<Vec<u64>>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    word2_one_total_acks: Option<u64>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    word2_bit8_acks: Option<Vec<u64>>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    word2_bit8_total_acks: Option<u64>,
+ }
+ 
+ pub struct ChecksumPowerSerial {
+@@ -96,8 +116,108 @@
+                 phase: 0,
+                 frame: [0; 4],
+                 response: 0,
++                initialization_commands: false,
++                commands: vec![],
++                inactive_countdown: false,
++                countdown_resets: vec![],
++                latched_startup_cause: false,
++                status16_unknown: false,
++                word2_one_acks: None,
++                word2_one_total_acks: None,
++                word2_bit8_acks: None,
++                word2_bit8_total_acks: None,
+             },
+         })
++    }
++
++    /// Diagnostic command contract; does not model enabled/pending transitions.
++    pub fn with_initialization_commands(self) -> Result<Self, String> {
++        self.initialization_commands(false)
++    }
++
++    /// A preexisting input only: the first initialization command invalidates status16.
++    pub fn with_latched_startup_cause(self) -> Result<Self, String> {
++        self.initialization_commands(true)
++    }
++
++    // Explicit fixed reads are independent of command writes; commands never supply readback.
++    fn initialization_commands(mut self, latched_cause: bool) -> Result<Self, String> {
++        let status = if latched_cause { 0x10 } else { 0 };
++        if self.state.inputs.get(&16) != Some(&status)
++            || [16, 17].iter().any(|r| self.state.retained_registers.contains(r))
++            || self
++                .state
++                .disable_writes
++                .iter()
++                .any(|(register, _)| [16, 17].contains(register))
++            || self
++                .state
++                .rtc
++                .as_ref()
++                .is_some_and(|rtc| rtc.config.owns(17))
++        {
++            return Err("Power initialization commands require the declared status16 input and exclusive status16/command17 write ownership".into());
++        }
++        self.state.initialization_commands = true;
++        self.state.latched_startup_cause = latched_cause;
++        Ok(self)
++    }
++
++    /// Selected checksum echo only; the fixed read input and hardware state stay independent.
++    pub fn with_word2_one_echo(mut self) -> Result<Self, String> {
++        if !self.state.inputs.contains_key(&2)
++            || self.state.word2_one_acks.is_some()
++            || self.state.retained_registers.contains(&2)
++            || self.state.disable_writes.iter().any(|(r, _)| *r == 2)
++            || self.state.rtc.as_ref().is_some_and(|r| r.config.owns(2))
++        {
++            return Err("Word2 echo requires a separate fixed read input and exclusive write ownership".into());
++        }
++        self.state.word2_one_acks = Some(Vec::new());
++        Ok(self)
++    }
++
++    /// Diagnostic recording only: retain the first2560001 ticks and a checked total.
++    pub fn with_word2_one_count_only(mut self) -> Result<Self, String> {
++        if self.state.word2_one_acks.as_ref().is_none_or(|acks| !acks.is_empty())
++            || self.state.word2_one_total_acks.is_some()
++        {
++            return Err("Word2 one count-only recording requires an unused separate0001 echo and cannot be enabled twice".into());
++        }
++        self.state.word2_one_total_acks = Some(0);
++        Ok(self)
++    }
++
++    /// Synthetic 0101 checksum echo only; no word2 hardware effects or readback.
++    pub fn with_word2_bit8_echo(mut self) -> Result<Self, String> {
++        if self.state.word2_one_acks.is_none() || self.state.word2_bit8_acks.is_some() {
++            return Err("Word2 bit8 echo requires the separate0001 echo and cannot be enabled twice".into());
++        }
++        self.state.word2_bit8_acks = Some(Vec::new());
++        self.state.word2_bit8_total_acks = Some(0);
++        Ok(self)
++    }
++
++    /// No timer is armed; only the observed initialization request is admitted.
++    pub fn with_inactive_countdown(mut self) -> Result<Self, String> {
++        if self.state.inputs.get(&18) != Some(&0)
++            || [18, 37, 38].iter().any(|register| {
++                self.state.retained_registers.contains(register)
++                    || self.state.disable_writes.iter().any(|(r, _)| r == register)
++                    || self
++                        .state
++                        .rtc
++                        .as_ref()
++                        .is_some_and(|rtc| rtc.config.owns(*register))
++            })
++        {
++            return Err(
++                "Inactive countdown requires zero status18 and exclusive timer write ownership"
++                    .into(),
++            );
++        }
++        self.state.inactive_countdown = true;
++        Ok(self)
+     }
+ }
+ 
+@@ -120,6 +240,9 @@
+         let register = header & 127;
+         let reply = match s.phase {
+             0 => {
++                if header & 128 == 0 && register == 16 && s.status16_unknown {
++                    return Err("Power status16 after initialization is unqualified".into());
++                }
+                 s.response = if header & 128 == 0 {
+                     if let Some(rtc) = s.rtc.as_ref().filter(|r| r.config.owns(register)) {
+                         rtc.read(register, tick)?
+@@ -150,15 +273,73 @@
+                 }
+                 if header & 128 != 0 {
+                     let value = u16::from_be_bytes([s.frame[1], s.frame[2]]);
+-                    if let Some(rtc) = s.rtc.as_mut().filter(|r| r.config.owns(register)) {
++                    if register == 2 && value == 0x0101 && let Some(acks) = s.word2_bit8_acks.as_mut() {
++                        let total = s.word2_bit8_total_acks.as_mut().ok_or("Word2 bit8 echo lacks its acknowledgment counter")?;
++                        let next = total.checked_add(1).ok_or("Word2 bit8 checksum echo acknowledgment count overflow")?;
++                        if acks.len() < 256 {
++                            acks.push(tick);
++                        }
++                        *total = next;
++                        u16::from(s.frame[3])
++                    } else if register == 2 && let Some(acks) = s.word2_one_acks.as_mut() {
++                        if value != 1 {
++                            return Err(format!("Word2 checksum echo only admits complete value0x0001, got0x{value:04x}"));
++                        }
++                        if let Some(total) = s.word2_one_total_acks.as_mut() {
++                            let next = total.checked_add(1).ok_or("Word2 one checksum echo acknowledgment count overflow")?;
++                            if acks.len() < 256 {
++                                acks.push(tick);
++                            }
++                            *total = next;
++                        } else {
++                            if acks.len() >= 256 {
++                                return Err("Word2 checksum echo receipt trace is full".into());
++                            }
++                            acks.push(tick);
++                        }
++                        u16::from(s.frame[3])
++                    } else if register == 17 && s.initialization_commands {
++                        if s.commands.len() >= 256 {
++                            return Err("Power command trace is full".into());
++                        }
++                        if matches!(value, 0x7f00 | 0x3700) {
++                            s.commands.push((tick, value));
++                            s.status16_unknown |= s.latched_startup_cause;
++                            u16::from(s.frame[3])
++                        } else if value & !3 == 0 {
++                            s.commands.push((tick, value));
++                            return Err(format!(
++                                "Power transition request0x{value:04x} is recorded but not emulated"
++                            ));
++                        } else {
++                            return Err(format!("Unsupported power command17 value0x{value:04x}"));
++                        }
++                    } else if register == 18 && s.inactive_countdown {
++                        if value != 0x0100 {
++                            return Err(format!(
++                                "Countdown arm/control18 value0x{value:04x} is not modeled"
++                            ));
++                        }
++                        if s.countdown_resets.len() >= 256 {
++                            return Err("Countdown initialization trace is full".into());
++                        }
++                        s.countdown_resets.push(tick);
++                        u16::from(s.frame[3])
++                    } else if let Some(rtc) = s.rtc.as_mut().filter(|r| r.config.owns(register)) {
+                         if register == rtc.config.control && value == rtc.retained_control_value() {
+-                            if s.retained_registers.is_empty()
+-                                || s.retained_written != s.retained_registers
+-                            {
+-                                return Err("Retained control commit requires fresh writes to every declared word".into());
++                            let unchanged = !s.retained_registers.is_empty()
++                                && s.retained_written.is_empty()
++                                && s.retained_registers.iter().all(|r| s.stored.contains_key(r))
++                                && rtc.allows_retained_echo(value, tick)?;
++                            if !unchanged {
++                                if s.retained_registers.is_empty()
++                                    || s.retained_written != s.retained_registers
++                                {
++                                    return Err("Retained control commit requires fresh writes to every declared word".into());
++                                }
++                                rtc.commit_retained(value, tick)?;
++                                s.retained_written.clear();
+                             }
+-                            rtc.commit_retained(value, tick)?;
+-                            s.retained_written.clear();
+                         } else {
+                             rtc.write(register, value, tick)?;
+                         }
+@@ -211,6 +392,39 @@
+             || state.inputs != s.inputs
+             || state.disable_writes != s.disable_writes
+             || state.retained_registers != s.retained_registers
++            || state.initialization_commands != s.initialization_commands
++            || state.inactive_countdown != s.inactive_countdown
++            || state.latched_startup_cause != s.latched_startup_cause
++            || state.status16_unknown != (state.latched_startup_cause && state.commands.iter()
++                .any(|(_, value)| matches!(*value, 0x7f00 | 0x3700)))
++            || state.word2_one_acks.is_some() != s.word2_one_acks.is_some()
++            || state.word2_one_acks.as_ref().is_some_and(|acks| {
++                acks.len() > 256 || acks.windows(2).any(|pair| pair[0] > pair[1])
++            })
++            || state.word2_one_total_acks.is_some() != s.word2_one_total_acks.is_some()
++            || match (&state.word2_one_acks, state.word2_one_total_acks) {
++                (_, None) => false,
++                (Some(acks), Some(total)) => acks.len() != total.min(256) as usize,
++                (None, Some(_)) => true,
++            }
++            || state.word2_bit8_acks.is_some() != s.word2_bit8_acks.is_some()
++            || state.word2_bit8_acks.as_ref().is_some_and(|acks| {
++                acks.len() > 256 || acks.windows(2).any(|pair| pair[0] > pair[1])
++            })
++            || state.word2_bit8_total_acks.is_some() != s.word2_bit8_total_acks.is_some()
++            || match (&state.word2_bit8_acks, state.word2_bit8_total_acks) {
++                (None, None) => false,
++                (Some(acks), Some(total)) => acks.len() != total.min(256) as usize,
++                _ => true,
++            }
++            || state.countdown_resets.len() > 256
++            || (!state.inactive_countdown && !state.countdown_resets.is_empty())
++            || state.commands.len() > 256
++            || (!state.initialization_commands && !state.commands.is_empty())
++            || state
++                .commands
++                .iter()
++                .any(|(_, value)| !matches!(*value, 0..=3 | 0x7f00 | 0x3700))
+             || state
+                 .stored
+                 .keys()
+@@ -290,6 +504,633 @@
+     }
+     fn frame(peer: &mut ChecksumPowerSerial, bytes: [u16; 4]) -> Result<Vec<u16>, String> {
+         bytes.into_iter().map(|b| peer.exchange(8, b, 0)).collect()
++    }
++
++    #[test]
++    fn diagnostic_initialization_does_not_admit_arbitrary_or_power_transition_writes() {
++        let (mut strict, _) = selected();
++        strict.state.inputs.insert(16, 0);
++        assert!(frame(&mut strict, [0x91, 0x7f, 0, 0xef]).is_err());
++        assert!(strict.state.commands.is_empty());
++
++        let (mut peer, mut gpio) = selected();
++        peer.state.inputs.insert(16, 0);
++        let mut peer = peer.with_initialization_commands().unwrap();
++        assert_eq!(
++            frame(&mut peer, [0x91, 0x7f, 0, 0xef]).unwrap(),
++            [0, 0, 0, 0xef]
++        );
++        assert_eq!(
++            frame(&mut peer, [0x91, 0x37, 0, 0x37]).unwrap(),
++            [0, 0, 0, 0x37]
++        );
++        assert_eq!(peer.state.commands, [(0, 0x7f00), (0, 0x3700)]);
++        assert!(!peer.state.stored.contains_key(&17));
++        assert_eq!(peer.state.inputs[&16], 0);
++        assert!(frame(&mut peer, [0x91, 1, 0, 0x6d]).is_err());
++        select(&mut gpio, false);
++        select(&mut gpio, true);
++        assert!(
++            frame(&mut peer, [0x91, 0, 2, 0x6c])
++                .unwrap_err()
++                .contains("Power transition request")
++        );
++        assert_eq!(peer.state.commands.last(), Some(&(0, 2)));
++        let mut saved = peer.save();
++        saved["commands"] = serde_json::json!([[0, 0x8000]]);
++        assert!(peer.restore(&saved).is_err());
++
++        let (mut nonzero, _) = selected();
++        nonzero.state.inputs.insert(16, 1);
++        assert!(nonzero.with_initialization_commands().is_err());
++    }
++
++    #[test]
++    fn explicit_command_read_input_is_independent_of_writes_and_checkpoint_identity() {
++        let (mut peer, _) = selected();
++        peer.state.inputs.insert(16, 0x10);
++        peer.state.inputs.insert(17, 0xa55a);
++        let mut peer = peer.with_latched_startup_cause().unwrap();
++        let read = [17, 0, 0, 0xee];
++        let response = [0, 0xa5, 0x5a, 0xef];
++        assert_eq!(frame(&mut peer, read).unwrap(), response);
++        for (value, checksum) in [(0x7f00, 0xef), (0x3700, 0x37)] {
++            assert_eq!(frame(&mut peer, [0x91, value >> 8, value & 255, checksum]).unwrap(), [0, 0, 0, checksum]);
++            assert_eq!(frame(&mut peer, read).unwrap(), response);
++        }
++        assert_eq!(peer.state.commands, [(0, 0x7f00), (0, 0x3700)]);
++        assert!(!peer.state.stored.contains_key(&17));
++        assert!(peer.state.status16_unknown);
++        let saved = peer.save();
++        peer.restore(&saved).unwrap();
++        let mut changed = saved;
++        changed["inputs"]["17"] = 0.into();
++        assert!(peer.restore(&changed).is_err());
++        assert_eq!(frame(&mut peer, read).unwrap(), response);
++
++        let (mut absent, _) = selected();
++        absent.state.inputs.insert(16, 0x10);
++        let mut absent = absent.with_latched_startup_cause().unwrap();
++        assert_eq!(frame(&mut absent, read).unwrap_err(), "Unsupported checksum power SPI read register17");
++    }
++
++    #[test]
++    fn latched_cause_is_readable_only_before_a_valid_initialization_command() {
++        let (mut peer, mut gpio) = selected();
++        peer.state.inputs.insert(16, 0x10);
++        let mut peer = peer.with_latched_startup_cause().unwrap();
++        assert_eq!(frame(&mut peer, [16, 0, 0, 0xef]).unwrap(), [0, 0, 0x10, 0xdf]);
++        let initial = peer.save();
++        assert!(frame(&mut peer, [0x91, 0x7f, 0, 0]).is_err());
++        assert!(!peer.state.status16_unknown);
++        assert!(peer.state.commands.is_empty());
++        select(&mut gpio, false);
++        select(&mut gpio, true);
++        assert_eq!(frame(&mut peer, [0x91, 0x7f, 0, 0xef]).unwrap(), [0, 0, 0, 0xef]);
++        assert!(peer.state.status16_unknown);
++        assert_eq!(peer.state.inputs[&16], 0x10);
++        let after = peer.save();
++        peer.restore(&after).unwrap();
++        assert!(frame(&mut peer, [16, 0, 0, 0xef]).unwrap_err().contains("unqualified"));
++        let mut invalid = after;
++        invalid["status16_unknown"] = false.into();
++        assert!(peer.restore(&invalid).is_err());
++        peer.restore(&initial).unwrap();
++        assert_eq!(frame(&mut peer, [16, 0, 0, 0xef]).unwrap(), [0, 0, 0x10, 0xdf]);
++        let (mut wrong, _) = selected();
++        wrong.state.inputs.insert(16, 1);
++        assert!(wrong.with_latched_startup_cause().is_err());
++    }
++
++    #[test]
++    fn inactive_countdown_admits_only_reset_with_zero_status_and_no_timer() {
++        let (mut strict, _) = selected();
++        strict.state.inputs.insert(18, 0);
++        assert!(frame(&mut strict, [0x92, 1, 0, 0x6c]).is_err());
++        let (mut peer, _) = selected();
++        peer.state.inputs.insert(18, 0);
++        let mut peer = peer.with_inactive_countdown().unwrap();
++        assert_eq!(
++            frame(&mut peer, [0x92, 1, 0, 0x6c]).unwrap(),
++            [0, 0, 0, 0x6c]
++        );
++        assert_eq!(peer.state.countdown_resets, [0]);
++        assert_eq!(peer.state.inputs[&18], 0);
++        assert!(!peer.state.stored.contains_key(&18));
++        let saved = peer.save();
++        peer.restore(&saved).unwrap();
++        assert!(
++            frame(&mut peer, [0x92, 1, 1, 0x6b])
++                .unwrap_err()
++                .contains("not modeled")
++        );
++        assert_eq!(peer.state.countdown_resets, [0]);
++        let mut invalid = saved;
++        invalid["countdown_resets"] = serde_json::json!(vec![0; 257]);
++        assert!(peer.restore(&invalid).is_err());
++        let (mut active, _) = selected();
++        active.state.inputs.insert(18, 0x10);
++        assert!(active.with_inactive_countdown().is_err());
++        let (mut overlap, _) = selected();
++        overlap.state.inputs.insert(18, 0);
++        overlap.state.retained_registers.insert(37);
++        assert!(overlap.with_inactive_countdown().is_err());
++    }
++
++    #[test]
++    fn explicit_countdown_read_inputs_do_not_arm_or_acquire_write_behavior() {
++        let (mut peer, mut gpio) = selected();
++        peer.state.inputs.insert(18, 0);
++        peer.state.inputs.insert(37, 0x1234);
++        peer.state.inputs.insert(38, 0xabcd);
++        let mut peer = peer.with_inactive_countdown().unwrap();
++        let read37 = [37, 0, 0, 0xda];
++        let read38 = [38, 0, 0, 0xd9];
++        assert_eq!(frame(&mut peer, read37).unwrap(), [0, 0x12, 0x34, 0x94]);
++        assert_eq!(frame(&mut peer, read38).unwrap(), [0, 0xab, 0xcd, 0x61]);
++        assert_eq!(frame(&mut peer, [0x92, 1, 0, 0x6c]).unwrap(), [0, 0, 0, 0x6c]);
++        assert_eq!(frame(&mut peer, read37).unwrap(), [0, 0x12, 0x34, 0x94]);
++        assert_eq!(frame(&mut peer, read38).unwrap(), [0, 0xab, 0xcd, 0x61]);
++        let saved = peer.save();
++        assert!(frame(&mut peer, [0x92, 1, 1, 0x6b]).unwrap_err().contains("not modeled"));
++        assert_eq!(peer.state.countdown_resets, [0]);
++        select(&mut gpio, false);
++        select(&mut gpio, true);
++        assert!(frame(&mut peer, [0xa5, 0, 0, 0x5a]).unwrap_err().contains("write register37"));
++        peer.restore(&saved).unwrap();
++        let mut wrong = saved;
++        wrong["inputs"]["37"] = 0.into();
++        assert!(peer.restore(&wrong).is_err());
++        assert!(!peer.state.stored.contains_key(&37) && !peer.state.stored.contains_key(&38));
++
++        let (mut absent, _) = selected();
++        absent.state.inputs.insert(18, 0);
++        let mut absent = absent.with_inactive_countdown().unwrap();
++        assert!(frame(&mut absent, read37).unwrap_err().contains("read register37"));
++    }
++
++    #[test]
++    fn selected_word2_echo_keeps_fixed_read_data_and_other_state_independent() {
++        let (mut strict, _) = selected();
++        strict.state.inputs.insert(2, 0xa55a);
++        assert!(frame(&mut strict, [0x82, 0, 1, 0x7c]).unwrap_err().contains("write register2"));
++        assert!(strict.save().get("word2_one_acks").is_none());
++        let (mut peer, mut gpio) = selected();
++        peer.state.inputs.insert(2, 0xa55a);
++        let mut peer = peer.with_word2_one_echo().unwrap();
++        let before = peer.save();
++        assert_eq!(peer.exchange(8, 0x82, 0).unwrap(), 0);
++        assert_eq!(peer.exchange(8, 0, 0).unwrap(), 0);
++        assert!(peer.state.word2_one_acks.as_ref().unwrap().is_empty());
++        let partial = peer.save();
++        peer.restore(&partial).unwrap();
++        assert_eq!(peer.exchange(8, 1, 0).unwrap(), 0);
++        assert_eq!(peer.exchange(8, 0x7c, 0).unwrap(), 0x7c);
++        assert_eq!(frame(&mut peer, [0x82, 0, 1, 0x7c]).unwrap(), [0, 0, 0, 0x7c]);
++        assert_eq!(peer.state.word2_one_acks, Some(vec![0, 0]));
++        assert_eq!(frame(&mut peer, [2, 0, 0, 0xfd]).unwrap(), [0, 0xa5, 0x5a, 0xfe]);
++        assert_eq!(peer.state.inputs, serde_json::from_value(before["inputs"].clone()).unwrap());
++        assert!(peer.state.stored.is_empty() && peer.state.retained_written.is_empty());
++        assert!(peer.state.commands.is_empty() && peer.state.countdown_resets.is_empty());
++        assert!(peer.state.rtc.is_none() && !peer.state.status16_unknown);
++        let saved = peer.save();
++        for value in [0u16, 2, 3, 0x8001] {
++            let [hi, lo] = value.to_be_bytes();
++            let checksum = 255u8.wrapping_sub(0x82).wrapping_sub(hi).wrapping_sub(lo);
++            assert!(frame(&mut peer, [0x82, u16::from(hi), u16::from(lo), u16::from(checksum)]).is_err());
++            peer.restore(&saved).unwrap();
++        }
++        assert!(frame(&mut peer, [0x82, 0, 1, 0x7d]).unwrap_err().contains("checksum"));
++        peer.restore(&saved).unwrap();
++        select(&mut gpio, false);
++        select(&mut gpio, true);
++        assert_eq!(frame(&mut peer, [2, 0, 0, 0xfd]).unwrap(), [0, 0xa5, 0x5a, 0xfe]);
++        assert_eq!(peer.state.word2_one_acks, Some(vec![0, 0]));
++    }
++
++    #[test]
++    fn word2_echo_checkpoint_identity_bounds_and_ownership_are_validated() {
++        let (missing, _) = selected();
++        assert!(missing.with_word2_one_echo().is_err());
++        let (mut disabled, _) = selected();
++        disabled.state.inputs.insert(2, 0);
++        let disabled_checkpoint = disabled.save();
++        let (mut peer, _) = selected();
++        peer.state.inputs.insert(2, 0);
++        let mut peer = peer.with_word2_one_echo().unwrap();
++        assert!(peer.restore(&disabled_checkpoint).is_err());
++        assert!(disabled.restore(&peer.save()).is_err());
++        let mut too_many = peer.save();
++        too_many["word2_one_acks"] = serde_json::json!(vec![0; 257]);
++        assert!(peer.restore(&too_many).is_err());
++        let mut reversed = peer.save();
++        reversed["word2_one_acks"] = serde_json::json!([2, 1]);
++        assert!(peer.restore(&reversed).is_err());
++        for _ in 0..256 {
++            assert_eq!(frame(&mut peer, [0x82, 0, 1, 0x7c]).unwrap(), [0, 0, 0, 0x7c]);
++        }
++        assert!(frame(&mut peer, [0x82, 0, 1, 0x7c]).unwrap_err().contains("trace is full"));
++        assert_eq!(peer.state.word2_one_acks.as_ref().unwrap().len(), 256);
++        for stored in [false, true] {
++            let (mut overlap, _) = selected();
++            overlap.state.inputs.insert(2, 0);
++            if stored { overlap.state.retained_registers.insert(2); }
++            else { overlap.state.disable_writes.insert((2, 0)); }
++            assert!(overlap.with_word2_one_echo().is_err());
++        }
++    }
++
++    fn word2_bit8_peer() -> (ChecksumPowerSerial, Gpio) {
++        let (mut peer, gpio) = selected();
++        peer.state.inputs.insert(2, 0xa55a);
++        (peer.with_word2_one_echo().unwrap().with_word2_bit8_echo().unwrap(), gpio)
++    }
++
++    fn word2_rtc_config(control: u8) -> StagedConfig {
++        serde_json::from_value(serde_json::json!({
++            "control":control,"read_low":35,"read_high":36,"stage_low":29,"stage_high":30,
++            "commit_value":0x202,"valid_mask":2,"retained_valid_mask":1,
++            "strobe":{"mask":0x200,"set_through_ticks":0,"clear_from_ticks":1},
++            "initial_control":0,"initial_seconds":0,"ticks_per_second":10
++        })).unwrap()
++    }
++
++    #[test]
++    fn word2_bit8_echo_does_not_expand_strict_or_one_only_contracts() {
++        let (mut strict, _) = selected();
++        strict.state.inputs.insert(2, 0xa55a);
++        assert!(strict.save().get("word2_one_acks").is_none());
++        assert!(strict.save().get("word2_bit8_acks").is_none());
++        assert!(strict.save().get("word2_bit8_total_acks").is_none());
++        assert!(frame(&mut strict, [0x82, 1, 1, 0x7b]).unwrap_err().contains("write register2"));
++        let (mut peer, _) = selected();
++        peer.state.inputs.insert(2, 0xa55a);
++        let mut peer = peer.with_word2_one_echo().unwrap();
++        assert!(peer.save().get("word2_bit8_acks").is_none());
++        assert!(peer.save().get("word2_bit8_total_acks").is_none());
++        assert_eq!(frame(&mut peer, [0x82, 1, 1, 0x7b]).unwrap_err(),
++            "Word2 checksum echo only admits complete value0x0001, got0x0101");
++        assert!(peer.state.word2_one_acks.as_ref().unwrap().is_empty());
++        assert!(peer.state.word2_bit8_acks.is_none());
++    }
++
++    #[test]
++    fn word2_bit8_echo_keeps_separate_receipts_and_all_other_state_independent() {
++        let pins = Pins::new([0;16]);
++        let mut gpio = Gpio::new(BASE, pins.clone()).unwrap();
++        let mut peer = ChecksumPowerSerial::new(pins, 12, 5, true, false,
++            [(2,0xa55a),(16,0),(18,0),(65,0xabcd)].into(), vec![],
++            Some(word2_rtc_config(39)), vec![31]).unwrap()
++            .with_initialization_commands().unwrap().with_inactive_countdown().unwrap()
++            .with_word2_one_echo().unwrap().with_word2_bit8_echo().unwrap();
++        select(&mut gpio, true);
++        frame(&mut peer, [0x9f, 0x12, 0x34, 0x1a]).unwrap();
++        frame(&mut peer, [0x91, 0x7f, 0, 0xef]).unwrap();
++        frame(&mut peer, [0x92, 1, 0, 0x6c]).unwrap();
++        let before = peer.save();
++        assert_eq!(frame(&mut peer, [0x82, 0, 1, 0x7c]).unwrap(), [0,0,0,0x7c]);
++        for tick in 1..=260 {
++            let reply: Vec<_> = [0x82,1,1,0x7b].into_iter()
++                .map(|byte|peer.exchange(8,byte,tick).unwrap()).collect();
++            assert_eq!(reply, [0,0,0,0x7b]);
++        }
++        assert_eq!(peer.state.word2_one_acks, Some(vec![0]));
++        assert_eq!(peer.state.word2_bit8_acks, Some((1..=256).collect()));
++        assert_eq!(peer.state.word2_bit8_total_acks, Some(260));
++        assert_eq!(frame(&mut peer, [2, 0, 0, 0xfd]).unwrap(), [0,0xa5,0x5a,0xfe]);
++        let after = peer.save();
++        for (key,value) in before.as_object().unwrap() {
++            if !["frame","response","word2_one_acks","word2_bit8_acks","word2_bit8_total_acks"].contains(&key.as_str()) {
++                assert_eq!(&after[key], value, "changed unrelated state {key}");
++            }
++        }
++        assert!(!peer.state.stored.contains_key(&2));
++    }
++
++    #[test]
++    fn word2_bit8_echo_rejects_other_full_words_registers_and_bad_checksums() {
++        let (mut peer, _) = word2_bit8_peer();
++        let saved = peer.save();
++        for (register,value) in [(2u16,0u16),(2,0x0100),(2,0x0102),(2,0x0201),(2,0x8001),(3,0x0101)] {
++            let header = 0x80 | register;
++            let hi = value >> 8;
++            let lo = value & 255;
++            assert!(frame(&mut peer, [header,hi,lo,!(header+hi+lo)&255]).is_err());
++            assert!(peer.state.word2_one_acks.as_ref().unwrap().is_empty());
++            assert!(peer.state.word2_bit8_acks.as_ref().unwrap().is_empty());
++            assert_eq!(peer.state.word2_bit8_total_acks, Some(0));
++            peer.restore(&saved).unwrap();
++        }
++        assert!(frame(&mut peer, [0x82,1,1,0x7c]).unwrap_err().contains("checksum"));
++        assert!(peer.state.word2_bit8_acks.as_ref().unwrap().is_empty());
++        assert_eq!(peer.state.word2_bit8_total_acks, Some(0));
++        peer.restore(&saved).unwrap();
++        assert!(peer.exchange(16, 0x82, 0).unwrap_err().contains("eight-bit"));
++        assert!(peer.state.word2_bit8_acks.as_ref().unwrap().is_empty());
++    }
++
++    #[test]
++    fn word2_bit8_echo_partial_frames_restore_and_restart_without_early_receipts() {
++        let bytes = [0x82,1,1,0x7b];
++        for prefix in 1..=3 {
++            let (mut peer, mut gpio) = word2_bit8_peer();
++            for &byte in &bytes[..prefix] {
++                assert_eq!(peer.exchange(8, byte, 0).unwrap(), 0);
++            }
++            assert!(peer.state.word2_bit8_acks.as_ref().unwrap().is_empty());
++            assert_eq!(peer.state.word2_bit8_total_acks, Some(0));
++            let partial = peer.save();
++            let (mut resumed, _) = word2_bit8_peer();
++            resumed.restore(&partial).unwrap();
++            for (i,&byte) in bytes.iter().enumerate().skip(prefix) {
++                assert_eq!(resumed.exchange(8, byte, 0).unwrap(), if i == 3 {0x7b} else {0});
++            }
++            assert_eq!(resumed.state.word2_bit8_acks, Some(vec![0]));
++            assert_eq!(resumed.state.word2_bit8_total_acks, Some(1));
++            assert!(resumed.state.word2_one_acks.as_ref().unwrap().is_empty());
++            select(&mut gpio, false);
++            select(&mut gpio, true);
++            assert_eq!(frame(&mut peer, [0x82,0,1,0x7c]).unwrap(), [0,0,0,0x7c]);
++            assert_eq!(peer.state.word2_one_acks, Some(vec![0]));
++            assert!(peer.state.word2_bit8_acks.as_ref().unwrap().is_empty());
++        }
++    }
++
++    #[test]
++    fn word2_bit8_echo_requires_prior_ownership_and_distinct_checkpoint_identity() {
++        let (missing, _) = selected();
++        assert!(missing.with_word2_bit8_echo().is_err());
++        let (mut strict, _) = selected();
++        strict.state.inputs.insert(2,0xa55a);
++        let strict_saved = strict.save();
++        assert!(strict.with_word2_bit8_echo().is_err());
++        let (mut one, _) = selected();
++        one.state.inputs.insert(2,0xa55a);
++        let mut one = one.with_word2_one_echo().unwrap();
++        let one_saved = one.save();
++        let (mut both, _) = word2_bit8_peer();
++        let both_saved = both.save();
++        assert!(one.restore(&both_saved).is_err());
++        assert!(both.restore(&one_saved).is_err());
++        assert!(both.restore(&strict_saved).is_err());
++        assert!(one.restore(&strict_saved).is_err());
++        let (mut strict, _) = selected();
++        strict.state.inputs.insert(2,0xa55a);
++        assert!(strict.restore(&one_saved).is_err());
++        assert!(strict.restore(&both_saved).is_err());
++        assert!(both.with_word2_bit8_echo().is_err());
++        for conflict in 0..3 {
++            let (mut peer, _) = selected();
++            peer.state.inputs.insert(2,0xa55a);
++            match conflict {
++                0 => { peer.state.retained_registers.insert(2); }
++                1 => { peer.state.disable_writes.insert((2,0)); }
++                _ => { peer.state.rtc = Some(StagedClock::new(word2_rtc_config(2)).unwrap()); }
++            }
++            assert!(peer.with_word2_one_echo().and_then(|p|p.with_word2_bit8_echo()).is_err());
++        }
++        let (mut peer, _) = word2_bit8_peer();
++        let mut unknown = peer.save();
++        unknown["unqualified_word2_mode"] = serde_json::json!(true);
++        assert!(peer.restore(&unknown).is_err());
++    }
++
++    #[test]
++    fn word2_bit8_recording_is_bounded_without_raising_the_one_only_cap() {
++        let (mut peer, _) = word2_bit8_peer();
++        let saved = peer.save();
++        for key in ["word2_one_acks","word2_bit8_acks"] {
++            for invalid in [vec![0;257],vec![2,1]] {
++                let mut value = saved.clone();
++                if key == "word2_bit8_acks" {
++                    value["word2_bit8_total_acks"] = serde_json::json!(invalid.len());
++                }
++                value[key] = serde_json::json!(invalid);
++                assert!(peer.restore(&value).is_err());
++            }
++        }
++        for _ in 0..256 {
++            frame(&mut peer, [0x82,0,1,0x7c]).unwrap();
++        }
++        let one_full = peer.save();
++        assert_eq!(frame(&mut peer, [0x82,0,1,0x7c]).unwrap_err(), "Word2 checksum echo receipt trace is full");
++        peer.restore(&one_full).unwrap();
++        for _ in 0..256 {
++            frame(&mut peer, [0x82,1,1,0x7b]).unwrap();
++        }
++        assert_eq!(peer.state.word2_one_acks.as_ref().unwrap().len(),256);
++        assert_eq!(peer.state.word2_bit8_acks.as_ref().unwrap().len(),256);
++        let both_full = peer.save();
++        peer.restore(&both_full).unwrap();
++        assert_eq!(frame(&mut peer, [0x82,1,1,0x7b]).unwrap(), [0,0,0,0x7b]);
++        assert_eq!(peer.state.word2_bit8_acks.as_ref().unwrap().len(),256);
++        assert_eq!(peer.state.word2_bit8_total_acks, Some(257));
++        let after_257 = peer.save();
++        peer.restore(&after_257).unwrap();
++    }
++
++    #[test]
++    fn word2_bit8_recording_restore_rejects_v1_and_inconsistent_counts() {
++        let (mut peer, _) = word2_bit8_peer();
++        let empty = peer.save();
++        assert_eq!(empty["word2_bit8_total_acks"], 0);
++        let mut ordered = empty.clone();
++        ordered["word2_bit8_total_acks"] = serde_json::json!(2);
++        ordered["word2_bit8_acks"] = serde_json::json!([1,2]);
++        peer.restore(&ordered).unwrap();
++        peer.restore(&empty).unwrap();
++        for ticks in [Vec::<u64>::new(),vec![1]] {
++            let mut v1 = empty.clone();
++            v1.as_object_mut().unwrap().remove("word2_bit8_total_acks");
++            v1["word2_bit8_acks"] = serde_json::json!(ticks);
++            assert!(peer.restore(&v1).is_err());
++        }
++        for (count,ticks) in [(None,vec![]),(Some(1u64),vec![]),(Some(0),vec![0]),
++            (Some(2),vec![0]),(Some(256),vec![0;255]),(Some(257),vec![0;255])] {
++            let mut bad = empty.clone();
++            bad["word2_bit8_total_acks"] = serde_json::json!(count);
++            bad["word2_bit8_acks"] = serde_json::json!(ticks);
++            assert!(peer.restore(&bad).is_err());
++        }
++        let mut missing_vector = empty.clone();
++        missing_vector.as_object_mut().unwrap().remove("word2_bit8_acks");
++        assert!(peer.restore(&missing_vector).is_err());
++        let (mut one, _) = selected();
++        one.state.inputs.insert(2,0xa55a);
++        let mut one = one.with_word2_one_echo().unwrap();
++        let one_saved = one.save();
++        one.restore(&one_saved).unwrap();
++        let mut invalid_disabled = one_saved.clone();
++        invalid_disabled["word2_bit8_total_acks"] = serde_json::json!(0);
++        assert!(one.restore(&invalid_disabled).is_err());
++        assert!(one.restore(&empty).is_err());
++        assert!(peer.restore(&one_saved).is_err());
++        assert_eq!(peer.save(), empty);
++    }
++
++    #[test]
++    fn word2_bit8_recording_accepts_large_consistent_counts_and_checks_overflow_first() {
++        let (mut peer, _) = word2_bit8_peer();
++        let mut saved = peer.save();
++        saved["word2_bit8_acks"] = serde_json::json!(vec![0;256]);
++        saved["word2_bit8_total_acks"] = serde_json::json!(u64::MAX-1);
++        peer.restore(&saved).unwrap();
++        assert_eq!(frame(&mut peer, [0x82,1,1,0x7b]).unwrap(), [0,0,0,0x7b]);
++        assert_eq!(peer.state.word2_bit8_total_acks, Some(u64::MAX));
++        let full = peer.save();
++        assert_eq!(frame(&mut peer, [0x82,1,1,0x7b]).unwrap_err(),
++            "Word2 bit8 checksum echo acknowledgment count overflow");
++        assert_eq!(peer.state.word2_bit8_total_acks, Some(u64::MAX));
++        assert_eq!(peer.save()["word2_bit8_acks"], full["word2_bit8_acks"]);
++        assert!(peer.state.word2_one_acks.as_ref().unwrap().is_empty());
++        assert_eq!(peer.state.inputs[&2],0xa55a);
++        assert_eq!(peer.state.phase,3);
++        peer.restore(&full).unwrap();
++        assert_eq!(frame(&mut peer, [2,0,0,0xfd]).unwrap(), [0,0xa5,0x5a,0xfe]);
++    }
++
++    fn word2_one_count_peer() -> (ChecksumPowerSerial, Gpio) {
++        let (peer, gpio) = word2_bit8_peer();
++        (peer.with_word2_one_count_only().unwrap(), gpio)
++    }
++
++    #[test]
++    fn word2_one_count_only_retains_prefix_and_preserves_read_and_unrelated_state() {
++        let pins = Pins::new([0;16]);
++        let mut gpio = Gpio::new(BASE,pins.clone()).unwrap();
++        let mut peer = ChecksumPowerSerial::new(pins,12,5,true,false,
++            [(2,0xa55a),(16,0),(18,0),(65,0xabcd)].into(),vec![],
++            Some(word2_rtc_config(39)),vec![31]).unwrap()
++            .with_initialization_commands().unwrap().with_inactive_countdown().unwrap()
++            .with_word2_one_echo().unwrap().with_word2_one_count_only().unwrap()
++            .with_word2_bit8_echo().unwrap();
++        select(&mut gpio,true);
++        frame(&mut peer,[0x9f,0x12,0x34,0x1a]).unwrap();
++        frame(&mut peer,[0x91,0x7f,0,0xef]).unwrap();
++        frame(&mut peer,[0x92,1,0,0x6c]).unwrap();
++        assert_eq!(frame(&mut peer, [2,0,0,0xfd]).unwrap(), [0,0xa5,0x5a,0xfe]);
++        let before = peer.save();
++        for tick in 1..=300 {
++            let reply: Vec<_> = [0x82,0,1,0x7c].into_iter()
++                .map(|byte|peer.exchange(8,byte,tick).unwrap()).collect();
++            assert_eq!(reply, [0,0,0,0x7c]);
++        }
++        assert_eq!(peer.state.word2_one_acks, Some((1..=256).collect()));
++        assert_eq!(peer.state.word2_one_total_acks, Some(300));
++        assert_eq!(frame(&mut peer, [2,0,0,0xfd]).unwrap(), [0,0xa5,0x5a,0xfe]);
++        let after = peer.save();
++        for (key,value) in before.as_object().unwrap() {
++            if !["frame","response","word2_one_acks","word2_one_total_acks"].contains(&key.as_str()) {
++                assert_eq!(&after[key],value,"changed unrelated state {key}");
++            }
++        }
++        peer.restore(&after).unwrap();
++        frame(&mut peer, [0x82,1,1,0x7b]).unwrap();
++        assert_eq!(peer.state.word2_bit8_total_acks, Some(1));
++        assert_eq!(peer.state.word2_one_total_acks, Some(300));
++    }
++
++    #[test]
++    fn word2_one_count_only_rejects_bad_frames_and_resumes_only_complete_requests() {
++        for prefix in 1..=3 {
++            let (mut peer, mut gpio) = word2_one_count_peer();
++            let bytes = [0x82,0,1,0x7c];
++            for &byte in &bytes[..prefix] { peer.exchange(8,byte,10).unwrap(); }
++            assert_eq!(peer.state.word2_one_total_acks, Some(0));
++            let partial = peer.save();
++            let (mut resumed, _) = word2_one_count_peer();
++            resumed.restore(&partial).unwrap();
++            for &byte in &bytes[prefix..] { resumed.exchange(8,byte,10).unwrap(); }
++            assert_eq!(resumed.state.word2_one_acks, Some(vec![10]));
++            assert_eq!(resumed.state.word2_one_total_acks, Some(1));
++            select(&mut gpio,false);select(&mut gpio,true);
++            frame(&mut peer,bytes).unwrap();
++            assert_eq!(peer.state.word2_one_total_acks, Some(1));
++        }
++        let (mut peer, _) = word2_one_count_peer();
++        let saved = peer.save();
++        for (register,value) in [(2u16,0u16),(2,2),(2,0x0100),(2,0x0102),(2,0x0201),(2,0x8001),(3,1)] {
++            let header = 0x80|register; let hi=value>>8;let lo=value&255;
++            assert!(frame(&mut peer,[header,hi,lo,!(header+hi+lo)&255]).is_err());
++            assert_eq!(peer.state.word2_one_total_acks,Some(0));
++            assert!(peer.state.word2_one_acks.as_ref().unwrap().is_empty());
++            peer.restore(&saved).unwrap();
++        }
++        assert!(frame(&mut peer,[0x82,0,1,0x7d]).unwrap_err().contains("checksum"));
++        assert_eq!(peer.state.word2_one_total_acks,Some(0));
++        peer.restore(&saved).unwrap();
++        assert!(peer.exchange(16,0x82,0).is_err());
++        assert_eq!(peer.state.word2_one_total_acks,Some(0));
++    }
++
++    #[test]
++    fn word2_one_count_only_validates_checkpoint_identity_counts_and_order() {
++        let (mut peer, _) = word2_one_count_peer();
++        let empty=peer.save();
++        let (mut legacy, _) = word2_bit8_peer();
++        let legacy_saved=legacy.save();
++        assert!(legacy_saved.get("word2_one_total_acks").is_none());
++        legacy.restore(&legacy_saved).unwrap();
++        assert!(legacy.restore(&empty).is_err());
++        assert!(peer.restore(&legacy_saved).is_err());
++        for (count,ticks) in [(None,vec![]),(Some(1u64),vec![]),(Some(0),vec![0]),
++            (Some(2),vec![1]),(Some(256),vec![0;255]),(Some(257),vec![0;255]),
++            (Some(257),vec![0;257]),(Some(2),vec![2,1])] {
++            let mut bad=empty.clone();
++            bad["word2_one_total_acks"]=serde_json::json!(count);
++            bad["word2_one_acks"]=serde_json::json!(ticks);
++            assert!(peer.restore(&bad).is_err());
++            assert_eq!(peer.save(),empty);
++        }
++        for key in ["word2_one_total_acks","word2_one_acks"] {
++            let mut missing=empty.clone();missing.as_object_mut().unwrap().remove(key);
++            assert!(peer.restore(&missing).is_err());
++        }
++        let mut unknown=empty.clone();unknown["word2_one_count_unknown"]=true.into();
++        assert!(peer.restore(&unknown).is_err());
++        let mut valid=empty.clone();valid["word2_one_acks"]=serde_json::json!([1,2]);
++        valid["word2_one_total_acks"]=2.into();peer.restore(&valid).unwrap();
++        let (mut strict, _) = selected();strict.state.inputs.insert(2,0xa55a);
++        assert!(strict.restore(&empty).is_err());
++        let mut invalid_strict=strict.save();invalid_strict["word2_one_total_acks"]=0.into();
++        assert!(strict.restore(&invalid_strict).is_err());
++    }
++
++    #[test]
++    fn word2_one_count_only_requires_unused_ownership_and_preserves_legacy_cap() {
++        let (missing, _) = selected();assert!(missing.with_word2_one_count_only().is_err());
++        let (mut strict, _) = selected();strict.state.inputs.insert(2,0xa55a);
++        assert!(strict.with_word2_one_count_only().is_err());
++        let (peer, _) = word2_one_count_peer();assert!(peer.with_word2_one_count_only().is_err());
++        let (mut legacy, _) = word2_bit8_peer();
++        for _ in 0..256 {frame(&mut legacy,[0x82,0,1,0x7c]).unwrap();}
++        assert_eq!(frame(&mut legacy,[0x82,0,1,0x7c]).unwrap_err(),
++            "Word2 checksum echo receipt trace is full");
++        assert!(legacy.save().get("word2_one_total_acks").is_none());
++        assert!(legacy.with_word2_one_count_only().is_err());
++        let (mut one, _) = selected();one.state.inputs.insert(2,0xa55a);
++        let mut one=one.with_word2_one_echo().unwrap().with_word2_one_count_only().unwrap();
++        assert!(frame(&mut one,[0x82,1,1,0x7b]).is_err());
++        assert_eq!(one.state.word2_one_total_acks,Some(0));
++    }
++
++    #[test]
++    fn word2_one_count_only_checks_overflow_before_receipt_mutation() {
++        let (mut peer, _) = word2_one_count_peer();
++        let mut saved=peer.save();saved["word2_one_acks"]=serde_json::json!(vec![0;256]);
++        saved["word2_one_total_acks"]=serde_json::json!(u64::MAX-1);
++        peer.restore(&saved).unwrap();
++        frame(&mut peer,[0x82,0,1,0x7c]).unwrap();
++        assert_eq!(peer.state.word2_one_total_acks,Some(u64::MAX));
++        let full=peer.save();
++        assert_eq!(frame(&mut peer,[0x82,0,1,0x7c]).unwrap_err(),
++            "Word2 one checksum echo acknowledgment count overflow");
++        assert_eq!(peer.state.word2_one_total_acks,Some(u64::MAX));
++        assert_eq!(peer.save()["word2_one_acks"],full["word2_one_acks"]);
++        assert_eq!(peer.state.phase,3);
++        assert_eq!(peer.state.inputs[&2],0xa55a);
++        peer.restore(&full).unwrap();
++        assert_eq!(frame(&mut peer,[2,0,0,0xfd]).unwrap(),[0,0xa5,0x5a,0xfe]);
+     }
+ 
+     #[test]
+@@ -432,6 +1273,67 @@
+     }
+ 
+     #[test]
++    fn unchanged_retained_control_echo_is_opt_in_and_never_commits_partial_data() {
++        fn at(peer: &mut ChecksumPowerSerial, header: u16, value: u16, tick: u64) -> Result<Vec<u16>, String> {
++            let high = value >> 8;
++            let low = value & 255;
++            [header,high,low,!(header+high+low)&255].into_iter()
++                .map(|byte|peer.exchange(8,byte,tick)).collect()
++        }
++        for enabled in [false,true] {
++            let cfg: StagedConfig = serde_json::from_value(serde_json::json!({
++                "control":39,"read_low":35,"read_high":36,"stage_low":29,"stage_high":30,
++                "retained_control_echo":enabled,"commit_value":0x202,"valid_mask":2,
++                "retained_valid_mask":1,"strobe":{"mask":0x200,"set_through_ticks":0,"clear_from_ticks":1},
++                "initial_control":0,"initial_seconds":0,"ticks_per_second":10
++            })).unwrap();
++            let pins = Pins::new([0;16]);
++            let mut gpio = Gpio::new(BASE,pins.clone()).unwrap();
++            let mut peer = ChecksumPowerSerial::new(pins,12,5,true,false,BTreeMap::new(),vec![],Some(cfg),vec![31,32]).unwrap();
++            select(&mut gpio,true);
++            at(&mut peer,0x9d,0x5678,0).unwrap();
++            at(&mut peer,0x9e,0x1234,0).unwrap();
++            at(&mut peer,0xa7,0x202,10).unwrap();
++            at(&mut peer,0x9f,0x1111,11).unwrap();
++            at(&mut peer,0xa0,0x2222,11).unwrap();
++            at(&mut peer,0xa7,3,12).unwrap();
++            let rtc_before = peer.save()["rtc"].clone();
++            let result = at(&mut peer,0xa7,3,20);
++            assert_eq!(peer.save()["rtc"],rtc_before);
++            assert!(peer.state.retained_written.is_empty());
++            if !enabled {
++                assert!(result.unwrap_err().contains("fresh writes"));
++                continue;
++            }
++            assert_eq!(result.unwrap(),[0,0,0,0x55]);
++            assert_eq!(peer.state.rtc.as_ref().unwrap().counter.counter(20).unwrap(),0x12345679);
++            let complete = peer.save();
++            let mut missing = complete.clone();
++            missing["stored"].as_object_mut().unwrap().remove("31");
++            peer.restore(&missing).unwrap();
++            assert!(at(&mut peer,0xa7,3,20).unwrap_err().contains("fresh writes"));
++            peer.restore(&complete).unwrap();
++            assert!(at(&mut peer,0xa7,7,21).is_err());
++            assert_eq!(peer.save()["rtc"],rtc_before);
++            select(&mut gpio,false); select(&mut gpio,true);
++            at(&mut peer,0x9f,0xaaaa,22).unwrap();
++            assert!(at(&mut peer,0xa7,3,23).unwrap_err().contains("fresh writes"));
++            assert_eq!(peer.save()["rtc"],rtc_before);
++            assert_eq!(peer.state.retained_written,BTreeSet::from([31]));
++            select(&mut gpio,false); select(&mut gpio,true);
++            at(&mut peer,0xa0,0xbbbb,24).unwrap();
++            assert_eq!(at(&mut peer,0xa7,3,25).unwrap(),[0,0,0,0x55]);
++            assert!(peer.state.retained_written.is_empty());
++            assert_eq!(peer.save()["rtc"],rtc_before);
++            let saved = peer.save();
++            peer.restore(&saved).unwrap();
++            let mut wrong = saved;
++            wrong["rtc"]["config"]["retained_control_echo"] = false.into();
++            assert!(peer.restore(&wrong).is_err());
++        }
++    }
++
++    #[test]
+     fn stored_register_configuration_refuses_duplicates_and_command_overlap() {
+         for (retained, disables) in [
+             (vec![65, 65], vec![]),
+@@ -459,6 +1361,8 @@
+             read_high: 102,
+             stage_low: 103,
+             stage_high: 104,
++            staging_readback: false,
++            retained_control_echo: false,
+             commit_value: 0x202,
+             valid_mask: 2,
+             retained_valid_mask: 1,
+diff --git a/crates/emulator-xp4-board/src/definition.rs b/crates/emulator-xp4-board/src/definition.rs
+--- a/crates/emulator-xp4-board/src/definition.rs
++++ b/crates/emulator-xp4-board/src/definition.rs
+@@ -61,6 +61,18 @@
+     #[serde(default)]
+     pub power_spi: Option<(u64, bool, usize, usize, bool, BTreeMap<u8, u16>, u64)>,
+     #[serde(default)]
++    pub checksum_power_initialization_commands: bool,
++    #[serde(default)]
++    pub checksum_power_inactive_countdown: bool,
++    #[serde(default)]
++    pub checksum_power_latched_startup_cause: bool,
++    #[serde(default)]
++    pub checksum_power_word2_one_echo: bool,
++    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
++    pub checksum_power_word2_one_count_only: bool,
++    #[serde(default)]
++    pub checksum_power_word2_bit8_echo: bool,
++    #[serde(default)]
+     pub checksum_power_spi: Option<(
+         u64,
+         bool,
+diff --git a/crates/emulator-xp4-board/src/devices.rs b/crates/emulator-xp4-board/src/devices.rs
+--- a/crates/emulator-xp4-board/src/devices.rs
++++ b/crates/emulator-xp4-board/src/devices.rs
+@@ -239,6 +239,12 @@
+         disable_writes: Vec<(u8, u16)>,
+         rtc: Option<fujimod_emulator_xp4_io::rtc::StagedConfig>,
+         retained_registers: Vec<u8>,
++        initialization_commands: bool,
++        inactive_countdown: bool,
++        latched_startup_cause: bool,
++        word2_one_echo: bool,
++        word2_one_count_only: bool,
++        word2_bit8_echo: bool,
+     ) -> Result<(), String> {
+         let pins = self
+             .pins
+@@ -256,6 +262,20 @@
+             rtc,
+             retained_registers,
+         )?;
++        let part = if latched_startup_cause {
++            if !initialization_commands {
++                return Err("Latched startup cause requires initialization command tracing".into());
++            }
++            part.with_latched_startup_cause()?
++        } else if initialization_commands {
++            part.with_initialization_commands()?
++        } else {
++            part
++        };
++        let part = if inactive_countdown { part.with_inactive_countdown()? } else { part };
++        let part = if word2_one_echo { part.with_word2_one_echo()? } else { part };
++        let part = if word2_one_count_only { part.with_word2_one_count_only()? } else { part };
++        let part = if word2_bit8_echo { part.with_word2_bit8_echo()? } else { part };
+         self.spi_input(base, Box::new(part))
+     }
+ 
+diff --git a/crates/emulator-xp4-board/src/lib.rs b/crates/emulator-xp4-board/src/lib.rs
+--- a/crates/emulator-xp4-board/src/lib.rs
++++ b/crates/emulator-xp4-board/src/lib.rs
+@@ -940,6 +940,12 @@
+             temperature,
+             power_spi,
+             checksum_power_spi,
++            checksum_power_initialization_commands,
++            checksum_power_inactive_countdown,
++            checksum_power_latched_startup_cause,
++            checksum_power_word2_one_echo,
++            checksum_power_word2_one_count_only,
++            checksum_power_word2_bit8_echo,
+             imaging,
+             movdc,
+             sd_clocks,
+@@ -1092,6 +1098,9 @@
+                 .get_or_insert_with(devices::Devices::empty)
+                 .power_spi(base, idle, port, pin, high, inputs, rtc_ticks)?;
+         }
++        if (checksum_power_initialization_commands || checksum_power_inactive_countdown || checksum_power_latched_startup_cause || checksum_power_word2_one_echo || checksum_power_word2_one_count_only || checksum_power_word2_bit8_echo) && checksum_power_spi.is_none() {
++            return Err("Power initialization commands require a checksum peer".into());
++        }
+         if let Some((
+             base,
+             idle,
+@@ -1116,6 +1125,12 @@
+                     disable_writes,
+                     rtc,
+                     retained_registers,
++                    checksum_power_initialization_commands,
++                    checksum_power_inactive_countdown,
++                    checksum_power_latched_startup_cause,
++                    checksum_power_word2_one_echo,
++                    checksum_power_word2_one_count_only,
++                    checksum_power_word2_bit8_echo,
+                 )?;
+         }
+         for (base, miso) in spi_inputs {
